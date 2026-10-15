@@ -1,0 +1,34 @@
+name: script2-dev
+
+services:
+  migrate:
+    image: postgres:16-alpine
+    env_file: .env.migrate
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ["sh", "/migrations/run.sh"]
+    restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  script2:
+    build: .
+    image: script2:latest
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    # Один воркер для dev (проще дебажить)
+    deploy:
+      replicas: 1
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 10s
+    volumes:
+      - ./proxies.txt:/app/proxies.txt:ro
+      # Монтируем исходники - изменения видны сразу
+      - ./src/script2:/usr/local/lib/python3.12/site-packages/script2:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # После git pull: docker compose -f docker-compose.dev.yml restart script2
