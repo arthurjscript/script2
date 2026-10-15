@@ -8,11 +8,16 @@ from .models import HostRow, CheckResult
 
 SQL_CLAIM = """
 WITH picked AS (
-    SELECT id
-    FROM live_hosts
-    WHERE check_status IN ('new', 'retry')
-      AND (next_attempt_at IS NULL OR next_attempt_at <= now())
-    ORDER BY id
+    SELECT lh.id
+    FROM live_hosts lh
+    WHERE lh.check_status IN ('new', 'retry')
+      AND (lh.next_attempt_at IS NULL OR lh.next_attempt_at <= now())
+      -- Пропускаем если такой host:port уже проверен
+      AND NOT EXISTS (
+          SELECT 1 FROM checked_hosts ch
+          WHERE ch.host = lh.host AND ch.port = lh.port
+      )
+    ORDER BY lh.id
     LIMIT $1
     FOR UPDATE SKIP LOCKED
 )
