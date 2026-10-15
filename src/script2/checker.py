@@ -34,11 +34,12 @@ OPENAPI_PATHS = [
 # Паттерны чувствительных данных (из prototype/auth_checker/crypto_detect.py)
 SENSITIVE_PATTERNS = {
     # CRITICAL - прямые деньги
-    "password": re.compile(r'"password"\s*:\s*"([^"]{4,})"', re.I),
+    "password": re.compile(r'"(?:password|passwd|email_password|user_password|admin_password)"\s*:\s*"([^"]{3,})"', re.I),
     "private_key_pem": re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
     "evm_private_key": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"'),
-    # seed_phrase требует конкретные поля + минимум 50 символов (12 слов ~60 символов)
-    "seed_phrase": re.compile(r'"(?:seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"[^"]{50,}"', re.I),
+    "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"[^"]{20,}"', re.I),
+    "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[^"]{16,}"', re.I),
+    "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[^"]{16,}"', re.I),
     "stripe_live": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
     "stripe_restricted": re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
 
@@ -58,12 +59,20 @@ SENSITIVE_PATTERNS = {
     "auth_token": re.compile(r'"auth_token"\s*:\s*"[^"]{16,}"', re.I),
     "bearer_token": re.compile(r'"bearer"\s*:\s*"[^"]{16,}"', re.I),
     "jwt_token": re.compile(r'"jwt"\s*:\s*"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"'),
+    # HIGH - AWS
+    "aws_access_key": re.compile(r'AKIA[0-9A-Z]{16}'),
+    # HIGH - SMTP/DB credentials
+    "smtp_password": re.compile(r'"(?:smtp_pass|smtp_password)"\s*:\s*"[^"]{4,}"', re.I),
+    "database_url": re.compile(r'"(?:database_url|db_url)"\s*:\s*"[^"]+"', re.I),
+    # HIGH - generic access_token (not Facebook-specific)
+    "access_token": re.compile(r'"access_token"\s*:\s*"[^"]{20,}"', re.I),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
     "mysql_dsn": re.compile(r'mysql://[^\s"]+:[^\s"]+@[^\s"]+'),
     "mongodb_dsn": re.compile(r'mongodb(?:\+srv)?://[^\s"]+:[^\s"]+@[^\s"]+'),
     "redis_dsn": re.compile(r'redis://[^\s"]+:[^\s"]+@[^\s"]+'),
+    "amqp_dsn": re.compile(r'amqp://[^\s"]+:[^\s"]+@[^\s"]+'),
 
     # MEDIUM - PII and session tokens
     "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
@@ -108,6 +117,8 @@ SEVERITY_MAP = {
     "private_key_pem": "CRITICAL",
     "evm_private_key": "CRITICAL",
     "seed_phrase": "CRITICAL",
+    "secret_key": "CRITICAL",
+    "otp_secret": "CRITICAL",
     "stripe_live": "CRITICAL",
     "stripe_restricted": "CRITICAL",
     # HIGH - доступ к системам
@@ -125,11 +136,16 @@ SEVERITY_MAP = {
     "auth_token": "HIGH",
     "bearer_token": "HIGH",
     "jwt_token": "HIGH",
+    "aws_access_key": "HIGH",
+    "smtp_password": "HIGH",
+    "database_url": "HIGH",
+    "access_token": "HIGH",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
     "mongodb_dsn": "MEDIUM",
     "redis_dsn": "MEDIUM",
+    "amqp_dsn": "MEDIUM",
     # MEDIUM - PII and sessions
     "email": "MEDIUM",
     "session_id": "MEDIUM",
