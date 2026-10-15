@@ -18,9 +18,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
-    # Один воркер для dev (проще дебажить)
     deploy:
-      replicas: 1
+      replicas: 3
     restart: unless-stopped
     init: true
     stop_signal: SIGTERM
