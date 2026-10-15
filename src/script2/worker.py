@@ -183,6 +183,11 @@ async def reaper_loop(repo: Repository, cfg: Settings, stop: asyncio.Event) -> N
             if reaped:
                 log.info("Reaped %d expired leases: %s", len(reaped), reaped[:10])
 
+            # Помечаем дубликаты как done
+            duplicates = await repo.mark_duplicates_done()
+            if duplicates:
+                log.info("Marked %d duplicates as done", len(duplicates))
+
         except Exception as exc:
             log.error("Reaper error: %s", exc)
 

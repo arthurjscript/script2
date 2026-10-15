@@ -88,6 +88,18 @@ WHERE locked_by = $1 AND check_status = 'in_progress'
 RETURNING id
 """
 
+SQL_MARK_DUPLICATES_DONE = """
+UPDATE live_hosts lh
+SET check_status = 'done',
+    checked_at = now()
+WHERE lh.check_status IN ('new', 'retry')
+  AND EXISTS (
+      SELECT 1 FROM checked_hosts ch
+      WHERE ch.host = lh.host AND ch.port = lh.port
+  )
+RETURNING id
+"""
+
 
 class Repository:
     """Работа с БД: claim, save, retry, reap."""
@@ -175,4 +187,10 @@ class Repository:
         """Освобождает свои записи при остановке."""
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(SQL_RELEASE_MINE, self.worker_id)
+            return [r["id"] for r in rows]
+
+    async def mark_duplicates_done(self) -> list[int]:
+        """Помечает дубликаты как done (уже есть в checked_hosts)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(SQL_MARK_DUPLICATES_DONE)
             return [r["id"] for r in rows]
