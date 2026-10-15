@@ -26,9 +26,9 @@ services:
     stop_signal: SIGTERM
     stop_grace_period: 10s
     volumes:
-      - ./proxies.txt:/app/proxies.txt:ro
       # Монтируем исходники - изменения видны сразу
       - ./src/script2:/usr/local/lib/python3.12/site-packages/script2:ro
+      # proxies.txt опционален - создай если нужны прокси
     extra_hosts:
       - "host.docker.internal:host-gateway"
     # После git pull: docker compose -f docker-compose.dev.yml restart script2
