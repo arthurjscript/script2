@@ -64,6 +64,27 @@ SENSITIVE_PATTERNS = {
 # Маскированные значения (игнорируем)
 MASKED_VALUES = {"*", "**", "***", "****", "*****", "******", "********"}
 
+# Placeholder хосты в DSN (примеры из документации)
+PLACEHOLDER_HOSTS = {
+    "host", "hostname", "localhost", "127.0.0.1",
+    "example.com", "example.org", "your-host", "your-server",
+    "db-host", "database-host", "server", "dbserver",
+}
+
+
+def is_placeholder_dsn(dsn: str) -> bool:
+    """Проверяет что DSN - placeholder/пример."""
+    lower = dsn.lower()
+    # user:pass@host - явный пример
+    if "user:pass@" in lower or "username:password@" in lower:
+        return True
+    # Проверяем хост после @
+    if "@" in lower:
+        host_part = lower.split("@")[1].split("/")[0].split(":")[0]
+        if host_part in PLACEHOLDER_HOSTS:
+            return True
+    return False
+
 
 def is_masked_value(value: str) -> bool:
     """Проверяет что значение маскировано."""
@@ -122,6 +143,10 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 val_match = re.search(r':\s*"([^"]*)"', match.group(0))
                 if val_match and is_masked_value(val_match.group(1)):
                     continue
+
+            # Для DSN проверяем что не placeholder
+            if name.endswith("_dsn") and is_placeholder_dsn(match.group(0)):
+                continue
 
             patterns_found.append(name)
             sev = SEVERITY_MAP.get(name, "LOW")
