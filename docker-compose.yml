@@ -1,0 +1,68 @@
+name: script2
+
+services:
+  migrate:
+    image: postgres:16-alpine
+    env_file: .env.migrate
+    volumes:
+      - ./migrations:/migrations:ro
+    entrypoint: ["sh", "/migrations/run.sh"]
+    restart: "no"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  script2:
+    build: .
+    image: script2:latest
+    env_file: .env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+    init: true
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
+    volumes:
+      - ./proxies.txt:/app/proxies.txt:ro
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  adminpanel:
+    build: ./adminpanel
+    image: adminpanel:latest
+    env_file: .env.admin
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "9999:9999"
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres-dev:
+    image: postgres:16-alpine
+    profiles: ["dev"]
+    environment:
+      POSTGRES_DB: hosts
+      POSTGRES_PASSWORD: dev
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./dev/seed.sql:/docker-entrypoint-initdb.d/001_seed.sql:ro

@@ -1,0 +1,189 @@
+# -*- coding: utf-8 -*-
+"""Воркер: цикл обработки записей."""
+import asyncio
+import itertools
+import logging
+import os
+import time
+from pathlib import Path
+
+from .checker import check_host
+from .config import Settings
+from .models import HostRow
+from .repository import Repository
+
+log = logging.getLogger(__name__)
+
+
+class Worker:
+    """Воркер обработки записей из live_hosts."""
+
+    def __init__(
+        self,
+        repo: Repository,
+        cfg: Settings,
+        stop: asyncio.Event,
+        proxies: list[str] | None = None,
+    ) -> None:
+        self.repo = repo
+        self.cfg = cfg
+        self.stop = stop
+        self.proxies = proxies or []
+        self.proxy_cycle = itertools.cycle(self.proxies) if self.proxies else None
+
+        # Счётчики
+        self.claimed = 0
+        self.done_alive = 0
+        self.done_dead = 0
+        self.retry_count = 0
+        self.failed_count = 0
+        self.lost_lease = 0
+
+    def get_proxy(self) -> str | None:
+        """Возвращает следующий прокси из ротации."""
+        if self.proxy_cycle:
+            return next(self.proxy_cycle)
+        return None
+
+    def touch_heartbeat(self) -> None:
+        """Обновляет файл heartbeat для HEALTHCHECK."""
+        try:
+            Path(self.cfg.heartbeat_file).touch()
+        except OSError:
+            pass
+
+    async def process_one(self, row: HostRow) -> None:
+        """Обрабатывает одну запись."""
+        proxy = self.get_proxy()
+        log.debug("Processing id=%d ip=%s:%d proxy=%s", row.id, row.host, row.port, proxy)
+
+        try:
+            result = await asyncio.wait_for(
+                check_host(row, self.cfg, proxy=proxy),
+                timeout=self.cfg.check_timeout * 2,
+            )
+        except Exception as exc:
+            log.warning("Check failed id=%d error=%s", row.id, repr(exc))
+            await self.repo.mark_retry(row.id, repr(exc))
+            self.retry_count += 1
+            return
+
+        saved = await self.repo.save_result(row.id, row.attempts, result)
+
+        if not saved:
+            log.warning("Lost lease id=%d", row.id)
+            self.lost_lease += 1
+            return
+
+        if result.is_alive:
+            self.done_alive += 1
+            if result.vulnerable_count > 0:
+                log.info(
+                    "VULNERABLE id=%d ip=%s:%d vuln=%d patterns=%s severity=%s",
+                    row.id,
+                    row.host,
+                    row.port,
+                    result.vulnerable_count,
+                    result.data_patterns,
+                    result.severity,
+                )
+        else:
+            self.done_dead += 1
+
+    async def run(self) -> None:
+        """Основной цикл воркера."""
+        log.info(
+            "Worker started worker_id=%s concurrency=%d",
+            self.cfg.worker_id,
+            self.cfg.concurrency,
+        )
+
+        inflight: set[asyncio.Task[None]] = set()
+        last_stats = time.time()
+
+        while not self.stop.is_set():
+            self.touch_heartbeat()
+
+            # Выводим статистику раз в 60 секунд
+            if time.time() - last_stats >= 60:
+                log.info(
+                    "Stats: claimed=%d alive=%d dead=%d retry=%d failed=%d lost=%d inflight=%d",
+                    self.claimed,
+                    self.done_alive,
+                    self.done_dead,
+                    self.retry_count,
+                    self.failed_count,
+                    self.lost_lease,
+                    len(inflight),
+                )
+                last_stats = time.time()
+
+            # Забираем записи под свободные слоты
+            free = self.cfg.concurrency - len(inflight)
+            if free > 0:
+                limit = min(free, self.cfg.batch_size)
+                try:
+                    rows = await self.repo.claim(limit)
+                except Exception as exc:
+                    log.error("Claim failed: %s", exc)
+                    await asyncio.sleep(self.cfg.poll_interval)
+                    continue
+
+                self.claimed += len(rows)
+
+                for row in rows:
+                    task = asyncio.create_task(self.process_one(row))
+                    inflight.add(task)
+                    task.add_done_callback(inflight.discard)
+
+                if rows:
+                    continue
+
+            # Ждём завершения задач или таймаут
+            if inflight:
+                done, _ = await asyncio.wait(
+                    inflight,
+                    timeout=self.cfg.poll_interval,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            else:
+                await asyncio.sleep(self.cfg.poll_interval)
+
+        # Graceful shutdown: ждём завершения текущих задач
+        if inflight:
+            log.info("Shutdown: waiting for %d tasks...", len(inflight))
+            done, pending = await asyncio.wait(
+                inflight,
+                timeout=self.cfg.shutdown_timeout,
+            )
+            if pending:
+                log.warning("Shutdown: %d tasks still pending", len(pending))
+                for task in pending:
+                    task.cancel()
+
+        log.info(
+            "Worker stopped: claimed=%d alive=%d dead=%d",
+            self.claimed,
+            self.done_alive,
+            self.done_dead,
+        )
+
+
+async def reaper_loop(repo: Repository, cfg: Settings, stop: asyncio.Event) -> None:
+    """Фоновая задача: освобождает записи с истёкшей арендой."""
+    log.info("Reaper started interval=%ds", cfg.reaper_interval)
+
+    while not stop.is_set():
+        try:
+            await asyncio.sleep(cfg.reaper_interval)
+            if stop.is_set():
+                break
+
+            reaped = await repo.reap_expired()
+            if reaped:
+                log.info("Reaped %d expired leases: %s", len(reaped), reaped[:10])
+
+        except Exception as exc:
+            log.error("Reaper error: %s", exc)
+
+    log.info("Reaper stopped")
