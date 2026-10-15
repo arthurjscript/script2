@@ -59,6 +59,9 @@ SENSITIVE_PATTERNS = {
     "mysql_dsn": re.compile(r'mysql://[^\s"]+:[^\s"]+@[^\s"]+'),
     "mongodb_dsn": re.compile(r'mongodb(?:\+srv)?://[^\s"]+:[^\s"]+@[^\s"]+'),
     "redis_dsn": re.compile(r'redis://[^\s"]+:[^\s"]+@[^\s"]+'),
+
+    # MEDIUM - PII
+    "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
 }
 
 # Маскированные значения (игнорируем)
@@ -116,6 +119,8 @@ SEVERITY_MAP = {
     "mysql_dsn": "MEDIUM",
     "mongodb_dsn": "MEDIUM",
     "redis_dsn": "MEDIUM",
+    # MEDIUM - PII
+    "email": "MEDIUM",
 }
 
 
