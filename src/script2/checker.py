@@ -53,6 +53,11 @@ SENSITIVE_PATTERNS = {
     "sendgrid_key": re.compile(r'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'),
     "twilio_key": re.compile(r'SK[0-9a-fA-F]{32}'),
     "exchange_secret": re.compile(r'"(?:api_secret|apiSecret|secret_key|secretKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
+    # HIGH - auth tokens
+    "refresh_token": re.compile(r'"refresh_token"\s*:\s*"[^"]{16,}"', re.I),
+    "auth_token": re.compile(r'"auth_token"\s*:\s*"[^"]{16,}"', re.I),
+    "bearer_token": re.compile(r'"bearer"\s*:\s*"[^"]{16,}"', re.I),
+    "jwt_token": re.compile(r'"jwt"\s*:\s*"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"'),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
@@ -60,8 +65,10 @@ SENSITIVE_PATTERNS = {
     "mongodb_dsn": re.compile(r'mongodb(?:\+srv)?://[^\s"]+:[^\s"]+@[^\s"]+'),
     "redis_dsn": re.compile(r'redis://[^\s"]+:[^\s"]+@[^\s"]+'),
 
-    # MEDIUM - PII
+    # MEDIUM - PII and session tokens
     "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
+    "session_id": re.compile(r'"session_id"\s*:\s*"[^"]{8,}"', re.I),
+    "session_token": re.compile(r'"session_token"\s*:\s*"[^"]{8,}"', re.I),
 }
 
 # Маскированные значения (игнорируем)
@@ -114,13 +121,19 @@ SEVERITY_MAP = {
     "sendgrid_key": "HIGH",
     "twilio_key": "HIGH",
     "exchange_secret": "HIGH",
+    "refresh_token": "HIGH",
+    "auth_token": "HIGH",
+    "bearer_token": "HIGH",
+    "jwt_token": "HIGH",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
     "mongodb_dsn": "MEDIUM",
     "redis_dsn": "MEDIUM",
-    # MEDIUM - PII
+    # MEDIUM - PII and sessions
     "email": "MEDIUM",
+    "session_id": "MEDIUM",
+    "session_token": "MEDIUM",
 }
 
 
