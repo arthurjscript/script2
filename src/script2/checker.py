@@ -107,6 +107,18 @@ PLACEHOLDER_HOSTS = {
     "db-host", "database-host", "server", "dbserver",
 }
 
+# AWS example keys (из документации)
+AWS_EXAMPLE_KEYS = {
+    "AKIAIOSFODNN7EXAMPLE",
+    "AKIAI44QH8DHBEXAMPLE",
+    "AKIAEXAMPLEKEY",
+}
+
+
+def is_aws_example_key(key: str) -> bool:
+    """Проверяет что AWS ключ - пример из документации."""
+    return key in AWS_EXAMPLE_KEYS or "EXAMPLE" in key.upper()
+
 
 def is_placeholder_dsn(dsn: str) -> bool:
     """Проверяет что DSN - placeholder/пример."""
@@ -208,6 +220,11 @@ def classify_response(body: str) -> tuple[list[str], str]:
             if name == "password":
                 val_match = re.search(r':\s*"([^"]*)"', match.group(0))
                 if val_match and is_masked_value(val_match.group(1)):
+                    continue
+
+            # Для AWS ключей проверяем что не пример
+            if name == "aws_access_key":
+                if is_aws_example_key(match.group(0)):
                     continue
 
             # Для DSN проверяем что не placeholder
