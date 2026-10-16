@@ -97,6 +97,14 @@ SENSITIVE_PATTERNS = {
     "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
     "session_id": re.compile(r'"session_id"\s*:\s*"[^"]{8,}"', re.I),
     "session_token": re.compile(r'"session_token"\s*:\s*"[^"]{8,}"', re.I),
+
+    # TEST - проверить и удалить ненужные
+    "admin_password": re.compile(r'"admin_password"\s*:\s*"[^"]{3,}"', re.I),
+    "balance": re.compile(r'"balance"\s*:\s*"?[\d.]+', re.I),
+    "wp_auth_key": re.compile(r'"(?:auth_key|secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
+    "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
+    "db_password": re.compile(r'"(?:db_password|DB_PASSWORD)"\s*:\s*"[^"]{3,}"'),
+    "checker": re.compile(r'"checker"\s*:\s*"[^"]+"', re.I),
 }
 
 # Маскированные значения (игнорируем)
@@ -195,6 +203,13 @@ SEVERITY_MAP = {
     "email": "MEDIUM",
     "session_id": "MEDIUM",
     "session_token": "MEDIUM",
+    # TEST patterns
+    "admin_password": "CRITICAL",
+    "balance": "MEDIUM",
+    "wp_auth_key": "HIGH",
+    "wp_salt": "HIGH",
+    "db_password": "CRITICAL",
+    "checker": "MEDIUM",
 }
 
 
