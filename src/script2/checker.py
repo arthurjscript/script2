@@ -80,7 +80,6 @@ SENSITIVE_PATTERNS = {
     "mailgun_key": re.compile(r'key-[0-9a-f]{32}'),
     "npm_token": re.compile(r'npm_[A-Za-z0-9]{36}'),
     "pypi_token": re.compile(r'pypi-[A-Za-z0-9_-]{80,}'),
-    "heroku_key": re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
     "shopify_key": re.compile(r'shpat_[a-fA-F0-9]{32}'),
     "dropbox_token": re.compile(r'sl\.[A-Za-z0-9_-]{130,}'),
 
@@ -170,7 +169,6 @@ SEVERITY_MAP = {
     "mailgun_key": "HIGH",
     "npm_token": "HIGH",
     "pypi_token": "HIGH",
-    "heroku_key": "HIGH",
     "shopify_key": "HIGH",
     "dropbox_token": "HIGH",
     # MEDIUM - DSN
