@@ -39,6 +39,7 @@ SENSITIVE_PATTERNS = {
     "evm_private_key": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"'),
     "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"[^"]{20,}"', re.I),
     "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[^"]{16,}"', re.I),
+    "private_key": re.compile(r'"(?:private_key|privatekey|priv_key|privKey)"\s*:\s*"[^"]{16,}"', re.I),
     "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[^"]{16,}"', re.I),
     "stripe_live": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
     "stripe_restricted": re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
@@ -63,9 +64,12 @@ SENSITIVE_PATTERNS = {
     "aws_access_key": re.compile(r'AKIA[0-9A-Z]{16}'),
     # HIGH - SMTP/DB credentials
     "smtp_password": re.compile(r'"(?:smtp_pass|smtp_password)"\s*:\s*"[^"]{4,}"', re.I),
-    "database_url": re.compile(r'"(?:database_url|db_url)"\s*:\s*"[^"]+"', re.I),
+    "database_url": re.compile(r'"(?:database_url|db_url|dsn|connection_string)"\s*:\s*"[^"]+"', re.I),
+    "credential": re.compile(r'"(?:credential|credentials)"\s*:\s*"[^"]{8,}"', re.I),
     # HIGH - generic access_token (not Facebook-specific)
     "access_token": re.compile(r'"access_token"\s*:\s*"[^"]{20,}"', re.I),
+    # HIGH - API keys
+    "api_key": re.compile(r'"(?:api_key|apikey|apiKey)"\s*:\s*"[^"]{16,}"', re.I),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
@@ -118,6 +122,7 @@ SEVERITY_MAP = {
     "evm_private_key": "CRITICAL",
     "seed_phrase": "CRITICAL",
     "secret_key": "CRITICAL",
+    "private_key": "CRITICAL",
     "otp_secret": "CRITICAL",
     "stripe_live": "CRITICAL",
     "stripe_restricted": "CRITICAL",
@@ -139,7 +144,9 @@ SEVERITY_MAP = {
     "aws_access_key": "HIGH",
     "smtp_password": "HIGH",
     "database_url": "HIGH",
+    "credential": "HIGH",
     "access_token": "HIGH",
+    "api_key": "HIGH",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
