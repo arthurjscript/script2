@@ -37,6 +37,9 @@ SENSITIVE_PATTERNS = {
     "password": re.compile(r'"(?:password|passwd|email_password|user_password|admin_password)"\s*:\s*"([^"]{3,})"', re.I),
     "private_key_pem": re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
     "evm_private_key": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"'),
+    "bitcoin_wif": re.compile(r'"(?:private_key|wif|priv)"\s*:\s*"[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"'),
+    "extended_key": re.compile(r'\b(xprv|yprv|zprv|tprv)[1-9A-HJ-NP-Za-km-z]{50,}\b'),
+    "solana_key": re.compile(r'"(?:private_key|secret_key|solana_key)"\s*:\s*"[1-9A-HJ-NP-Za-km-z]{87,88}"'),
     "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"[^"]{20,}"', re.I),
     "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[^"]{16,}"', re.I),
     "private_key": re.compile(r'"(?:private_key|privatekey|priv_key|privKey)"\s*:\s*"[^"]{16,}"', re.I),
@@ -62,6 +65,9 @@ SENSITIVE_PATTERNS = {
     "jwt_token": re.compile(r'"jwt"\s*:\s*"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"'),
     # HIGH - AWS
     "aws_access_key": re.compile(r'AKIA[0-9A-Z]{16}'),
+    "aws_secret_key": re.compile(r'"(?:aws_secret|secret_access_key|aws_secret_access_key)"\s*:\s*"[A-Za-z0-9/+=]{40}"'),
+    # HIGH - Exchange
+    "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # HIGH - SMTP/DB credentials
     "smtp_password": re.compile(r'"(?:smtp_pass|smtp_password)"\s*:\s*"[^"]{4,}"', re.I),
     "database_url": re.compile(r'"(?:database_url|db_url|dsn|connection_string)"\s*:\s*"[^"]+"', re.I),
@@ -77,6 +83,7 @@ SENSITIVE_PATTERNS = {
     "mongodb_dsn": re.compile(r'mongodb(?:\+srv)?://[^\s"]+:[^\s"]+@[^\s"]+'),
     "redis_dsn": re.compile(r'redis://[^\s"]+:[^\s"]+@[^\s"]+'),
     "amqp_dsn": re.compile(r'amqp://[^\s"]+:[^\s"]+@[^\s"]+'),
+    "smtp_dsn": re.compile(r'smtp://[^\s"]+:[^\s"]+@[^\s"]+'),
 
     # MEDIUM - PII and session tokens
     "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
@@ -120,6 +127,9 @@ SEVERITY_MAP = {
     "password": "CRITICAL",
     "private_key_pem": "CRITICAL",
     "evm_private_key": "CRITICAL",
+    "bitcoin_wif": "CRITICAL",
+    "extended_key": "CRITICAL",
+    "solana_key": "CRITICAL",
     "seed_phrase": "CRITICAL",
     "secret_key": "CRITICAL",
     "private_key": "CRITICAL",
@@ -142,6 +152,8 @@ SEVERITY_MAP = {
     "bearer_token": "HIGH",
     "jwt_token": "HIGH",
     "aws_access_key": "HIGH",
+    "aws_secret_key": "HIGH",
+    "binance_key": "HIGH",
     "smtp_password": "HIGH",
     "database_url": "HIGH",
     "credential": "HIGH",
@@ -153,6 +165,7 @@ SEVERITY_MAP = {
     "mongodb_dsn": "MEDIUM",
     "redis_dsn": "MEDIUM",
     "amqp_dsn": "MEDIUM",
+    "smtp_dsn": "MEDIUM",
     # MEDIUM - PII and sessions
     "email": "MEDIUM",
     "session_id": "MEDIUM",
