@@ -124,6 +124,27 @@ AWS_EXAMPLE_KEYS = {
     "AKIAEXAMPLEKEY",
 }
 
+# Placeholder значения (когда значение = название поля)
+PLACEHOLDER_VALUES = {
+    "password", "passwd", "secret", "token", "key", "api_key", "apikey",
+    "email", "username", "user", "login", "string", "your_password",
+    "your_token", "your_key", "your_secret", "enter_password", "test",
+    "example", "sample", "demo", "placeholder", "changeme", "change_me",
+}
+
+
+def is_placeholder_value(field: str, value: str) -> bool:
+    """Проверяет что значение - placeholder (совпадает с именем поля или типичный пример)."""
+    val_lower = value.lower().strip()
+    field_lower = field.lower().replace("_", "").replace("-", "")
+    # Значение совпадает с полем: "password": "Password"
+    if val_lower == field_lower or val_lower.replace("_", "") == field_lower:
+        return True
+    # Типичные placeholder значения
+    if val_lower in PLACEHOLDER_VALUES:
+        return True
+    return False
+
 
 def is_aws_example_key(key: str) -> bool:
     """Проверяет что AWS ключ - пример из документации."""
@@ -232,11 +253,13 @@ def classify_response(body: str) -> tuple[list[str], str]:
     for name, pattern in SENSITIVE_PATTERNS.items():
         match = pattern.search(body)
         if match:
-            # Для password проверяем что значение не маскировано
-            if name == "password":
-                val_match = re.search(r':\s*"([^"]*)"', match.group(0))
-                if val_match and is_masked_value(val_match.group(1)):
-                    continue
+            # Для password проверяем что значение не маскировано и не placeholder
+            if name in ("password", "admin_password", "db_password", "smtp_password"):
+                val_match = re.search(r'"(\w+)"\s*:\s*"([^"]*)"', match.group(0))
+                if val_match:
+                    field, val = val_match.group(1), val_match.group(2)
+                    if is_masked_value(val) or is_placeholder_value(field, val):
+                        continue
 
             # Для AWS ключей проверяем что не пример
             if name == "aws_access_key":
