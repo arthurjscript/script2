@@ -74,8 +74,15 @@ SENSITIVE_PATTERNS = {
     "credential": re.compile(r'"(?:credential|credentials)"\s*:\s*"[^"]{8,}"', re.I),
     # HIGH - generic access_token (not Facebook-specific)
     "access_token": re.compile(r'"access_token"\s*:\s*"[^"]{20,}"', re.I),
-    # HIGH - API keys
-    "api_key": re.compile(r'"(?:api_key|apikey|apiKey)"\s*:\s*"[^"]{16,}"', re.I),
+    # HIGH - API keys with strict patterns
+    "google_api_key": re.compile(r'AIza[0-9A-Za-z_-]{35}'),
+    "openai_key": re.compile(r'sk-[A-Za-z0-9]{48,}'),
+    "mailgun_key": re.compile(r'key-[0-9a-f]{32}'),
+    "npm_token": re.compile(r'npm_[A-Za-z0-9]{36}'),
+    "pypi_token": re.compile(r'pypi-[A-Za-z0-9_-]{80,}'),
+    "heroku_key": re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'),
+    "shopify_key": re.compile(r'shpat_[a-fA-F0-9]{32}'),
+    "dropbox_token": re.compile(r'sl\.[A-Za-z0-9_-]{130,}'),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
@@ -158,7 +165,14 @@ SEVERITY_MAP = {
     "database_url": "HIGH",
     "credential": "HIGH",
     "access_token": "HIGH",
-    "api_key": "HIGH",
+    "google_api_key": "HIGH",
+    "openai_key": "HIGH",
+    "mailgun_key": "HIGH",
+    "npm_token": "HIGH",
+    "pypi_token": "HIGH",
+    "heroku_key": "HIGH",
+    "shopify_key": "HIGH",
+    "dropbox_token": "HIGH",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
