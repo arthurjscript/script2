@@ -40,10 +40,12 @@ SENSITIVE_PATTERNS = {
     "bitcoin_wif": re.compile(r'"(?:private_key|wif|priv)"\s*:\s*"[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"'),
     "extended_key": re.compile(r'\b(xprv|yprv|zprv|tprv)[1-9A-HJ-NP-Za-km-z]{50,}\b'),
     "solana_key": re.compile(r'"(?:private_key|secret_key|solana_key)"\s*:\s*"[1-9A-HJ-NP-Za-km-z]{87,88}"'),
-    "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"[^"]{20,}"', re.I),
-    "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[^"]{16,}"', re.I),
-    "private_key": re.compile(r'"(?:private_key|privatekey|priv_key|privKey)"\s*:\s*"[^"]{16,}"', re.I),
-    "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[^"]{16,}"', re.I),
+    # seed_phrase: 12+ слов через пробел (BIP-39)
+    "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"([a-z]+(?:\s+[a-z]+){11,})"', re.I),
+    # secret_key: hex формат 32+ символов
+    "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[0-9a-fA-F]{32,}"'),
+    # otp_secret: base32 формат (A-Z, 2-7)
+    "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[A-Z2-7]{16,}"'),
     "stripe_live": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
     "stripe_restricted": re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
 
@@ -150,7 +152,6 @@ SEVERITY_MAP = {
     "solana_key": "CRITICAL",
     "seed_phrase": "CRITICAL",
     "secret_key": "CRITICAL",
-    "private_key": "CRITICAL",
     "otp_secret": "CRITICAL",
     "stripe_live": "CRITICAL",
     "stripe_restricted": "CRITICAL",
