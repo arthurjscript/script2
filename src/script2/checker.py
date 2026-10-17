@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
+from .ai_verify import extract_ai_keys, verify_ai_key
 from .config import Settings
 from .models import HostRow, CheckResult
 
@@ -254,6 +255,7 @@ SEVERITY_MAP = {
     "aws_secret_key": "HIGH",
     "binance_key": "HIGH",
     "ai_apikey": "HIGH",
+    "ai_key_valid": "HIGH",
     "exchange_keypair": "CRITICAL",
     "basic_auth": "HIGH",
     "reset_token": "HIGH",
@@ -436,6 +438,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             all_patterns: list[str] = []
             max_severity = "LOW"
             severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+            # AI-ключи, найденные в ответах (key -> provider), для верификации
+            ai_keys_found: dict[str, str] = {}
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -493,6 +497,11 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
+                                # Собираем AI-ключи для проверки баланса
+                                if cfg.ai_key_checks:
+                                    for prov, k in extract_ai_keys(body[:100_000]):
+                                        ai_keys_found.setdefault(k, prov)
+
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
 
@@ -530,6 +539,21 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     endpoints_data.append(ep_data)
                     result.total_endpoints += 1
 
+            # Проверка AI-ключей: валидность/баланс у провайдеров
+            # (только бесплатные эндпоинты - списания нет)
+            ai_key_checks: list[dict[str, Any]] = []
+            if cfg.ai_key_checks and ai_keys_found:
+                for k, prov in list(ai_keys_found.items())[: cfg.ai_key_max]:
+                    chk = await verify_ai_key(
+                        session, prov, k,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    ai_key_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("ai_key_valid")
+                        if severity_order.get(max_severity, 0) < 2:
+                            max_severity = "HIGH"
+
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))
             result.severity = max_severity
@@ -559,6 +583,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "endpoints_tested": result.total_endpoints,
                 "vulnerable": vulnerable_eps,
                 "withdraw_capable": bool(withdraw_eps),
+                "ai_key_checks": ai_key_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

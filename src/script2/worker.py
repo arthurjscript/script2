@@ -95,6 +95,16 @@ class Worker:
                     result.data_patterns,
                     result.severity,
                 )
+            for chk in result.data.get("ai_key_checks") or []:
+                if chk.get("status") == "valid":
+                    log.info(
+                        "AI_KEY_VALID id=%d ip=%s:%d provider=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("provider"),
+                        chk.get("detail") or "",
+                    )
         else:
             self.done_dead += 1
 

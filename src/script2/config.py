@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     reaper_interval: int = 60
     use_notify: bool = False
 
+    # AI key verification (валидность/баланс у провайдеров)
+    ai_key_checks: bool = True
+    ai_key_max: int = 5
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""
