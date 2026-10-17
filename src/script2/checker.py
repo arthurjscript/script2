@@ -81,11 +81,16 @@ SENSITIVE_PATTERNS = {
     # и исключает ровно 64 alnum (их ловит binance_key) - дублей нет.
     "ai_apikey": re.compile(
         r'(?:\b(?:sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
-        r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"(?![A-Za-z0-9]{64}")(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}")',
+        r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"'
+        r'(?![A-Za-z0-9]{64}")'  # ровно 64 alnum ловит binance_key
+        r'(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")'  # UUID - это id, не ключ
+        r'(?![ps]k_(?:live|test)_)'  # Stripe ключи ловит stripe_live
+        r'(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}")',
         re.I),
-    # Деньги: связка api_key+api_secret одной биржи - полный доступ к выводу
+    # Деньги: связка api_key+api_secret одной биржи - полный доступ к выводу.
+    # Между полями могут быть другие поля (client_id и т.п.), но не вложенные объекты
     "exchange_keypair": re.compile(
-        r'"(?:api_key|apiKey)"\s*:\s*"[^"]{16,}"\s*,\s*"(?:api_secret|apiSecret|secret_key|secretKey)"\s*:\s*"[^"]{8,}"'),
+        r'"(?:api_key|apiKey)"\s*:\s*"[^"]{16,}"[^{}]{0,200}?"(?:api_secret|apiSecret|secret_key|secretKey)"\s*:\s*"[^"]{8,}"'),
     # Вход в админку/аккаунт: креды прямо в Authorization
     "basic_auth": re.compile(r'"authorization"\s*:\s*"Basic\s+[A-Za-z0-9+/]{16,}={0,2}"', re.I),
     "reset_token": re.compile(r'"(?:reset_password_token|reset_token|password_reset_token)"\s*:\s*"[^"]{8,}"', re.I),
@@ -118,18 +123,15 @@ SENSITIVE_PATTERNS = {
     "amqp_dsn": re.compile(r'amqp://[^\s"]+:[^\s"]+@[^\s"]+'),
     "smtp_dsn": re.compile(r'smtp://[^\s"]+:[^\s"]+@[^\s"]+'),
 
-    # MEDIUM - PII and session tokens
-    "email": re.compile(r'"(?:email|e-mail)"\s*:\s*"[^"@]+@[^"]+"', re.I),
+    # MEDIUM - session tokens
     "session_id": re.compile(r'"session_id"\s*:\s*"[^"]{8,}"', re.I),
     "session_token": re.compile(r'"session_token"\s*:\s*"[^"]{8,}"', re.I),
 
     # TEST - проверить и удалить ненужные
     "admin_password": re.compile(r'"admin_password"\s*:\s*"[^"]{3,}"', re.I),
-    "balance": re.compile(r'"balance"\s*:\s*"?[\d.]+', re.I),
     "wp_auth_key": re.compile(r'"(?:auth_key|secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
     "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
     "db_password": re.compile(r'"(?:db_password|DB_PASSWORD)"\s*:\s*"[^"]{3,}"'),
-    "checker": re.compile(r'"checker"\s*:\s*"[^"]+"', re.I),
 
     # Crypto wallets and keys
     "wallet_address": re.compile(r'"(?:wallet_address|wallet|address)"\s*:\s*"(?:0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|[1-9A-HJ-NP-Za-km-z]{32,44})"'),
@@ -196,7 +198,25 @@ def is_placeholder_dsn(dsn: str) -> bool:
 
 def is_masked_value(value: str) -> bool:
     """Проверяет что значение маскировано."""
-    return value in MASKED_VALUES or set(value) == {"*"}
+    return value in MASKED_VALUES or set(value) <= {"*", ".", "-"}
+
+
+# Хеш пароля (не plaintext - требует взлома, не деньги сразу)
+HASHED_PASSWORD_RE = re.compile(r'^\{?(?:bcrypt|argon2|pbkdf2|scrypt)\}?[$0-9]', re.I)
+# Дата вида 2026-10-17
+DATE_VALUE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def is_junk_token_value(val: str) -> bool:
+    """Мусорные значения токенов/session id: fake_/mock_/demo_, даты, без цифр."""
+    v = val.strip()
+    if DATE_VALUE_RE.match(v):
+        return True
+    if re.match(r'(?i)^(fake|mock|test|demo|guest)[_-]', v):
+        return True
+    if not any(c.isdigit() for c in v):
+        return True
+    return False
 
 
 # Severity по паттернам (из prototype/auth_checker/crypto_detect.py)
@@ -258,18 +278,16 @@ SEVERITY_MAP = {
     "redis_dsn": "MEDIUM",
     "amqp_dsn": "MEDIUM",
     "smtp_dsn": "MEDIUM",
-    # MEDIUM - PII and sessions
-    "email": "MEDIUM",
+    # MEDIUM - sessions
     "session_id": "MEDIUM",
     "session_token": "MEDIUM",
     # TEST patterns
     "admin_password": "CRITICAL",
-    "balance": "MEDIUM",
     "wp_auth_key": "HIGH",
     "wp_salt": "HIGH",
     "db_password": "CRITICAL",
-    "checker": "MEDIUM",
-    "wallet_address": "HIGH",
+    # Адрес кошелька сам по себе денег не даёт (нужен ключ) - понижаем
+    "wallet_address": "MEDIUM",
     "private_key_generic": "CRITICAL",
 }
 
@@ -304,6 +322,20 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     field, val = val_match.group(1), val_match.group(2)
                     if is_masked_value(val) or is_placeholder_value(field, val):
                         continue  # placeholder - проверяем следующие вхождения
+                    if HASHED_PASSWORD_RE.match(val):
+                        continue  # хеш пароля, не plaintext
+
+            # Токены: отсеиваем мусорные значения (fake_, даты, без цифр)
+            if name in ("refresh_token", "auth_token", "bearer_token", "access_token", "session_id", "session_token"):
+                tok_match = re.search(r':\s*"([^"]*)"', value_text)
+                if tok_match and is_junk_token_value(tok_match.group(1)):
+                    continue
+
+            # credential: пропускаем не-секретные значения (дипломы, описания)
+            if name == "credential":
+                cred_match = re.search(r':\s*"([^"]*)"', value_text)
+                if cred_match and not any(c.isdigit() for c in cred_match.group(1)):
+                    continue
 
             # basic_auth: пропускаем примеры user:pass из документации
             if name == "basic_auth":
