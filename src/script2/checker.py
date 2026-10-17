@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Проверка хоста: OpenAPI discovery + auth check."""
 import asyncio
+import base64
 import json
 import re
 import ssl
@@ -15,6 +16,9 @@ from .models import HostRow, CheckResult
 
 
 # Пути для поиска OpenAPI
+# Money rule: пути вывода средств (только POST — GET-история не считается)
+WITHDRAW_PATH_RE = re.compile(r'(?:withdraw|withdrawal|payout|cash_?out)', re.I)
+
 OPENAPI_PATHS = [
     "/openapi.json",
     "/swagger.json",
@@ -34,7 +38,7 @@ OPENAPI_PATHS = [
 # Паттерны чувствительных данных (из prototype/auth_checker/crypto_detect.py)
 SENSITIVE_PATTERNS = {
     # CRITICAL - прямые деньги
-    "password": re.compile(r'"(?:password|passwd|email_password|user_password|admin_password)"\s*:\s*"([^"]{3,})"', re.I),
+    "password": re.compile(r'"(?:password|passwd|email_password|user_password)"\s*:\s*"([^"]{3,})"', re.I),
     "private_key_pem": re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
     "evm_private_key": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"'),
     "bitcoin_wif": re.compile(r'"(?:private_key|wif|priv)"\s*:\s*"[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"'),
@@ -48,6 +52,8 @@ SENSITIVE_PATTERNS = {
     "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[A-Z2-7]{16,}"'),
     "stripe_live": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
     "stripe_restricted": re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
+    # Money rule: разрешение вывода средств в конфиге/ответе
+    "withdraw_flag": re.compile(r'"(?:can_withdraw|withdraw_enabled|withdrawal_enabled|allow_withdraw)"\s*:\s*"?(?:true|1)"?'),
 
     # HIGH - доступ к системам
     "facebook_access_token": re.compile(r'"(?:access_token|page_access_token)"\s*:\s*"(EAA[A-Za-z0-9]{50,})"'),
@@ -59,7 +65,7 @@ SENSITIVE_PATTERNS = {
     "discord_webhook": re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+'),
     "sendgrid_key": re.compile(r'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'),
     "twilio_key": re.compile(r'SK[0-9a-fA-F]{32}'),
-    "exchange_secret": re.compile(r'"(?:api_secret|apiSecret|secret_key|secretKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
+    "exchange_secret": re.compile(r'"(?:api_secret|apiSecret)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # HIGH - auth tokens
     "refresh_token": re.compile(r'"refresh_token"\s*:\s*"[^"]{16,}"', re.I),
     "auth_token": re.compile(r'"auth_token"\s*:\s*"[^"]{16,}"', re.I),
@@ -70,9 +76,28 @@ SENSITIVE_PATTERNS = {
     "aws_secret_key": re.compile(r'"(?:aws_secret|secret_access_key|aws_secret_access_key)"\s*:\s*"[A-Za-z0-9/+=]{40}"'),
     # HIGH - Exchange
     "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
+    # AI/SaaS API-ключи: уникальные префиксы провайдеров + generic api_key поля.
+    # Generic часть требует цифру в значении (отсеиваем placeholder'ы вида "your_api_key")
+    # и исключает ровно 64 alnum (их ловит binance_key) - дублей нет.
+    "ai_apikey": re.compile(
+        r'(?:\b(?:sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
+        r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"(?![A-Za-z0-9]{64}")(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{20,}")',
+        re.I),
+    # Деньги: связка api_key+api_secret одной биржи - полный доступ к выводу
+    "exchange_keypair": re.compile(
+        r'"(?:api_key|apiKey)"\s*:\s*"[^"]{16,}"\s*,\s*"(?:api_secret|apiSecret|secret_key|secretKey)"\s*:\s*"[^"]{8,}"'),
+    # Вход в админку/аккаунт: креды прямо в Authorization
+    "basic_auth": re.compile(r'"authorization"\s*:\s*"Basic\s+[A-Za-z0-9+/]{16,}={0,2}"', re.I),
+    "reset_token": re.compile(r'"(?:reset_password_token|reset_token|password_reset_token)"\s*:\s*"[^"]{8,}"', re.I),
+    # Обход 2FA: backup/recovery коды
+    "two_fa_backup": re.compile(r'"(?:two_factor_backup|backup_codes|recovery_codes)"\s*:\s*(?:"[A-Za-z0-9_-]{6,}"|\[\s*")', re.I),
+    # Ответ подтверждает что учётка - админская
+    "admin_flag": re.compile(r'"(?:is_admin|super_admin|is_superuser)"\s*:\s*(?:true|1)\b', re.I),
+    # Крипта: Ethereum UTC keystore (расшифровывается паролем)
+    "keystore_json": re.compile(r'"cipher"\s*:\s*"?aes-', re.I),
     # HIGH - SMTP/DB credentials
     "smtp_password": re.compile(r'"(?:smtp_pass|smtp_password)"\s*:\s*"[^"]{4,}"', re.I),
-    "database_url": re.compile(r'"(?:database_url|db_url|dsn|connection_string)"\s*:\s*"[^"]+"', re.I),
+    "database_url": re.compile(r'"(?:database_url|db_url|dsn|connection_string)"\s*:\s*"[a-z][a-z0-9+.-]*://[^"]{4,}"', re.I),
     "credential": re.compile(r'"(?:credential|credentials)"\s*:\s*"[^"]{8,}"', re.I),
     # HIGH - generic access_token (not Facebook-specific)
     "access_token": re.compile(r'"access_token"\s*:\s*"[^"]{20,}"', re.I),
@@ -188,6 +213,8 @@ SEVERITY_MAP = {
     "otp_secret": "CRITICAL",
     "stripe_live": "CRITICAL",
     "stripe_restricted": "CRITICAL",
+    "withdraw_flag": "CRITICAL",
+    "withdraw_endpoint": "CRITICAL",
     # HIGH - доступ к системам
     "facebook_access_token": "HIGH",
     "github_token": "HIGH",
@@ -206,6 +233,13 @@ SEVERITY_MAP = {
     "aws_access_key": "HIGH",
     "aws_secret_key": "HIGH",
     "binance_key": "HIGH",
+    "ai_apikey": "HIGH",
+    "exchange_keypair": "CRITICAL",
+    "basic_auth": "HIGH",
+    "reset_token": "HIGH",
+    "two_fa_backup": "CRITICAL",
+    "admin_flag": "HIGH",
+    "keystore_json": "CRITICAL",
     "smtp_password": "HIGH",
     "database_url": "HIGH",
     "credential": "HIGH",
@@ -257,29 +291,50 @@ def classify_response(body: str) -> tuple[list[str], str]:
     severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
 
     for name, pattern in SENSITIVE_PATTERNS.items():
-        match = pattern.search(body)
-        if match:
+        matched = False
+        # Перебираем все вхождения: первое может оказаться placeholder'ом,
+        # а реальное значение - дальше по телу
+        for m in pattern.finditer(body):
+            value_text = m.group(0)
+
             # Для password проверяем что значение не маскировано и не placeholder
-            if name in ("password", "admin_password", "db_password", "smtp_password"):
-                val_match = re.search(r'"(\w+)"\s*:\s*"([^"]*)"', match.group(0))
+            if name in ("password", "admin_password", "db_password", "smtp_password", "reset_token"):
+                val_match = re.search(r'"(\w+)"\s*:\s*"([^"]*)"', value_text)
                 if val_match:
                     field, val = val_match.group(1), val_match.group(2)
                     if is_masked_value(val) or is_placeholder_value(field, val):
+                        continue  # placeholder - проверяем следующие вхождения
+
+            # basic_auth: пропускаем примеры user:pass из документации
+            if name == "basic_auth":
+                b64_match = re.search(r'Basic\s+([A-Za-z0-9+/=]+)', value_text, re.I)
+                if b64_match:
+                    try:
+                        user, _, pwd = base64.b64decode(b64_match.group(1)).decode("utf-8", "replace").partition(":")
+                    except (ValueError, UnicodeDecodeError):
+                        user, pwd = "", ""
+                    if user.lower() in PLACEHOLDER_VALUES or pwd.lower() in PLACEHOLDER_VALUES or is_masked_value(pwd):
                         continue
 
             # Для AWS ключей проверяем что не пример
             if name == "aws_access_key":
-                if is_aws_example_key(match.group(0)):
+                if is_aws_example_key(value_text):
                     continue
 
             # Для DSN проверяем что не placeholder
-            if name.endswith("_dsn") and is_placeholder_dsn(match.group(0)):
+            if name.endswith("_dsn") and is_placeholder_dsn(value_text):
                 continue
 
-            patterns_found.append(name)
-            sev = SEVERITY_MAP.get(name, "LOW")
-            if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
-                max_severity = sev
+            matched = True
+            break
+
+        if not matched:
+            continue
+
+        patterns_found.append(name)
+        sev = SEVERITY_MAP.get(name, "LOW")
+        if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
+            max_severity = sev
 
     return patterns_found, max_severity
 
@@ -293,6 +348,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
     base_url = row.base_url  # protocol://host:port
 
     started = time.perf_counter()
+    deadline = time.monotonic() + cfg.host_timeout
     result = CheckResult(is_alive=False)
 
     ssl_ctx = ssl.create_default_context()
@@ -316,6 +372,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             spec_path = None
 
             for path in OPENAPI_PATHS:
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     url = base_url.rstrip("/") + path
                     async with session.get(url, allow_redirects=False, proxy=proxy) as resp:
@@ -353,12 +411,21 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     continue
 
                 for method, details in methods.items():
+                    if time.monotonic() >= deadline:
+                        break
                     if method.upper() not in ("GET", "POST", "PUT", "DELETE", "PATCH"):
                         continue
 
                     # Проверяем security на уровне операции
                     op_security = details.get("security", None)
                     expects_auth = has_global_security if op_security is None else bool(op_security)
+
+                    # Money rule: POST на путь с withdraw/payout/cashout -
+                    # потенциальный вывод средств (GET-истории не считаем)
+                    withdraw_op = (
+                        method.upper() == "POST"
+                        and bool(WITHDRAW_PATH_RE.search(path_template))
+                    )
 
                     # Подставляем параметры пути
                     test_path = re.sub(r'\{[^}]+\}', '1', path_template)
@@ -388,6 +455,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             if resp.status == 200:
                                 # Классифицируем ответ
                                 patterns, sev = classify_response(body[:100_000])
+                                if withdraw_op:
+                                    patterns = patterns + ["withdraw_endpoint"]
+                                    sev = "CRITICAL"
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
@@ -395,11 +465,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     max_severity = sev
 
                                 # Логика verdict:
+                                # WITHDRAW_RISK - POST withdraw-эндпоинт доступен без auth
                                 # VULNERABLE - есть паттерны (реальные данные)
                                 # EXPOSED - expects_auth но доступен без auth (потенциальная проблема)
                                 # PUBLIC_OK - публичный эндпоинт
                                 if patterns:
-                                    ep_data["verdict"] = "VULNERABLE"
+                                    ep_data["verdict"] = "WITHDRAW_RISK" if withdraw_op else "VULNERABLE"
                                     result.vulnerable_count += 1
                                 elif expects_auth:
                                     ep_data["verdict"] = "EXPOSED"
@@ -445,10 +516,17 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 if ep.get("patterns")  # только с реальными паттернами
             ]
 
+            # Money rule: хосты с withdraw-эндпоинтами выделяем явно
+            withdraw_eps = [
+                ep for ep in vulnerable_eps
+                if "withdraw_endpoint" in ep["patterns"]
+            ]
+
             result.data = {
                 "spec_title": result.spec_title,
                 "endpoints_tested": result.total_endpoints,
                 "vulnerable": vulnerable_eps,
+                "withdraw_capable": bool(withdraw_eps),
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

@@ -60,7 +60,7 @@ class Worker:
         try:
             result = await asyncio.wait_for(
                 check_host(row, self.cfg, proxy=proxy),
-                timeout=self.cfg.check_timeout * 2,
+                timeout=self.cfg.host_timeout,
             )
         except Exception as exc:
             log.warning("Check failed id=%d error=%s", row.id, repr(exc))
@@ -77,6 +77,14 @@ class Worker:
 
         if result.is_alive:
             self.done_alive += 1
+            if result.data.get("withdraw_capable"):
+                log.warning(
+                    "WITHDRAW_CAPABLE id=%d ip=%s:%d severity=%s",
+                    row.id,
+                    row.host,
+                    row.port,
+                    result.severity,
+                )
             if result.vulnerable_count > 0:
                 log.info(
                     "VULNERABLE id=%d ip=%s:%d vuln=%d patterns=%s severity=%s",
