@@ -105,6 +105,10 @@ SENSITIVE_PATTERNS = {
     "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
     "db_password": re.compile(r'"(?:db_password|DB_PASSWORD)"\s*:\s*"[^"]{3,}"'),
     "checker": re.compile(r'"checker"\s*:\s*"[^"]+"', re.I),
+
+    # Crypto wallets and keys
+    "wallet_address": re.compile(r'"(?:wallet_address|wallet|address)"\s*:\s*"(?:0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|[1-9A-HJ-NP-Za-km-z]{32,44})"'),
+    "private_key_generic": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"[^"]{20,}"', re.I),
 }
 
 # Маскированные значения (игнорируем)
@@ -231,6 +235,8 @@ SEVERITY_MAP = {
     "wp_salt": "HIGH",
     "db_password": "CRITICAL",
     "checker": "MEDIUM",
+    "wallet_address": "HIGH",
+    "private_key_generic": "CRITICAL",
 }
 
 
