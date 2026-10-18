@@ -324,6 +324,7 @@ PLACEHOLDER_VALUES = {    "password", "passwd", "secret", "token", "key", "api_k
     "email", "username", "user", "login", "string", "your_password",
     "your_token", "your_key", "your_secret", "enter_password", "test",
     "example", "sample", "demo", "placeholder", "changeme", "change_me",
+    "redacted", "hidden", "removed",
 }
 
 
@@ -380,8 +381,15 @@ def is_placeholder_dsn(dsn: str) -> bool:
 
 
 def is_masked_value(value: str) -> bool:
-    """Проверяет что значение маскировано."""
-    return value in MASKED_VALUES or set(value) <= {"*", ".", "-"}
+    """Проверяет что значение маскировано или помечено санитизацией.
+
+    Кроме чистых звёздных масок ловит метки вида [redacted] и ***HIDDEN***:
+    обрезаем маскирующие символы и скобки, остаток сверяем с маркерами.
+    """
+    if value in MASKED_VALUES or set(value) <= {"*", ".", "-"}:
+        return True
+    core = value.strip(" *.-_[]").lower()
+    return core in ("redacted", "hidden", "removed")
 
 
 # Хеш пароля (не plaintext - требует взлома, не деньги сразу):
