@@ -131,6 +131,16 @@ class Worker:
                             row.port,
                             chk.get("username") or "?",
                         )
+            for chk in result.data.get("secret_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "SECRET_VALID id=%d ip=%s:%d kind=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("kind"),
+                        chk.get("detail") or "",
+                    )
             for chk in result.data.get("aws_key_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

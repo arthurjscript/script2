@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     dsn_checks: bool = True
     dsn_max: int = 3
 
+    # Service secret verification (stripe/slack/discord/github/..., read-only)
+    secret_checks: bool = True
+    secret_max: int = 10
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""

@@ -435,3 +435,186 @@ async def check_dsn(
     except Exception as exc:
         result["error"] = type(exc).__name__
     return result
+
+
+# --- Универсальная верификация сервисных секретов (read-only) ---
+
+SECRET_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
+    ("stripe", re.compile(r'\b(?:sk|rk)_live_[0-9a-zA-Z]{24,}\b')),
+    ("slack", re.compile(r'\bxox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}\b')),
+    ("discord", re.compile(r'\b[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{25,}\b')),
+    ("github", re.compile(r'\bgh[pousr]_[A-Za-z0-9]{36,}\b')),
+    ("gitlab", re.compile(r'\bglpat-[A-Za-z0-9\-]{20,}\b')),
+    ("mailgun", re.compile(r'\bkey-[0-9a-f]{32}\b')),
+    ("sendgrid", re.compile(r'\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b')),
+    ("npm", re.compile(r'\bnpm_[A-Za-z0-9]{36}\b')),
+    ("dropbox", re.compile(r'\bsl\.[A-Za-z0-9_-]{130,}\b')),
+]
+
+
+def extract_secrets(text: str) -> list[tuple[str, str]]:
+    """Извлекает сервисные секреты (stripe/slack/discord/github/...)."""
+    out: list[tuple[str, str]] = []
+    for kind, rx in SECRET_EXTRACTORS:
+        for v in rx.findall(text):
+            out.append((kind, v))
+    return list(dict.fromkeys(out))
+
+
+async def verify_secret(
+    session: aiohttp.ClientSession,
+    kind: str,
+    value: str,
+    proxy: str | None = None,
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """Проверяет сервисный секрет read-only запросом к провайдеру.
+
+    stripe: /v1/balance отдаёт реальный баланс (деньги!), slack: auth.test,
+    discord/githab/gitlab/mailgun/sendgrid/npm/dropbox: whoami-эндпоинты.
+    """
+    result: dict[str, Any] = {
+        "kind": kind, "value": value, "status": "error", "detail": "",
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
+    try:
+        if kind == "stripe":
+            async with session.get(
+                "https://api.stripe.com/v1/balance",
+                headers={"Authorization": f"Bearer {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    amounts = [
+                        f"{b.get('amount', 0) / 100:.2f} {b.get('currency', '')}"
+                        for b in (data.get("available") or [])[:3]
+                    ]
+                    result["status"] = "valid"
+                    result["detail"] = "balance: " + (", ".join(amounts) if amounts else "0")
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                elif resp.status == 403:
+                    # ключ жив, но нет права на чтение баланса (restricted)
+                    result["status"] = "valid"
+                    result["detail"] = "no balance permission"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "slack":
+            # slack возвращает HTTP 200 c ok:false для битого токена
+            async with session.get(
+                "https://slack.com/api/auth.test",
+                headers={"Authorization": f"Bearer {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("ok"):
+                        result["status"] = "valid"
+                        result["detail"] = f"user={data.get('user', '?')} team={data.get('team', '?')}"
+                    else:
+                        result["status"] = "invalid"
+                        result["detail"] = str(data.get("error", ""))
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "discord":
+            async with session.get(
+                "https://discord.com/api/v10/users/@me",
+                headers={"Authorization": f"Bot {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result["status"] = "valid"
+                    result["detail"] = f"@{data.get('username', '?')}"
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind in ("github", "gitlab"):
+            url = (
+                "https://api.github.com/user"
+                if kind == "github"
+                else "https://gitlab.com/api/v4/user"
+            )
+            headers = {
+                "Authorization": f"Bearer {value}",
+                "Accept": "application/vnd.github+json" if kind == "github" else "application/json",
+            }
+            async with session.get(url, headers=headers, proxy=proxy, timeout=timeout) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result["status"] = "valid"
+                    result["detail"] = str(data.get("login") or data.get("username") or "?")
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "mailgun":
+            async with session.get(
+                "https://api.mailgun.net/v3/domains",
+                auth=aiohttp.BasicAuth("api", value),
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    result["status"] = "valid"
+                    result["detail"] = "domains ok"
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "sendgrid":
+            async with session.get(
+                "https://api.sendgrid.com/v3/scopes",
+                headers={"Authorization": f"Bearer {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    result["status"] = "valid"
+                    result["detail"] = "scopes ok"
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "npm":
+            async with session.get(
+                "https://registry.npmjs.org/-/user/org.couchdb.user:me",
+                headers={"Authorization": f"Bearer {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result["status"] = "valid"
+                    result["detail"] = str(data.get("name", "?"))
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "dropbox":
+            # POST, но строго read-only (get_current_account)
+            async with session.post(
+                "https://api.dropboxapi.com/2/users/get_current_account",
+                headers={"Authorization": f"Bearer {value}"},
+                json=None,
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    result["status"] = "valid"
+                    result["detail"] = str(data.get("email", "?"))
+                elif resp.status == 401:
+                    result["status"] = "invalid"
+                    result["detail"] = "HTTP 401"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        else:
+            result["detail"] = f"unknown kind {kind}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result

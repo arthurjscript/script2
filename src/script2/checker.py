@@ -16,9 +16,11 @@ from .ai_verify import (
     extract_ai_keys,
     extract_aws_keypairs,
     extract_dsns,
+    extract_secrets,
     extract_telegram_bots,
     verify_ai_key,
     verify_aws_keypair,
+    verify_secret,
     verify_telegram_bot,
 )
 from .config import Settings
@@ -113,7 +115,7 @@ SENSITIVE_PATTERNS = {
     "gitlab_token": re.compile(r'glpat-[A-Za-z0-9\-]{20,}'),
     "telegram_bot": re.compile(r'\d{8,10}:[A-Za-z0-9_-]{35}'),
     "slack_token": re.compile(r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}'),
-    "discord_token": re.compile(r'[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27}'),
+    "discord_token": re.compile(r'\b[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{25,}\b'),
     "discord_webhook": re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+'),
     "sendgrid_key": re.compile(r'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'),
     "twilio_key": re.compile(r'SK[0-9a-fA-F]{32}'),
@@ -272,8 +274,22 @@ def is_masked_value(value: str) -> bool:
     return value in MASKED_VALUES or set(value) <= {"*", ".", "-"}
 
 
-# Хеш пароля (не plaintext - требует взлома, не деньги сразу)
-HASHED_PASSWORD_RE = re.compile(r'^\{?(?:bcrypt|argon2|pbkdf2|scrypt)\}?[$0-9]', re.I)
+# Хеш пароля (не plaintext - требует взлома, не деньги сразу):
+# {bcrypt}$..., bcrypt$..., $2a$10$... (raw bcrypt), $argon2id$..., $pbkdf2..., $scrypt...
+HASHED_PASSWORD_RE = re.compile(
+    r'^(?:\{?(?:bcrypt|argon2|pbkdf2|scrypt)\}?[$:0-9]'
+    r'|\$2[abxy]?\$\d+\$'
+    r'|\$9\$'
+    r'|\$6\$'
+    r'|\$argon2[id]{0,2}\$'
+    r'|\$pbkdf2'
+    r'|\$scrypt)',
+    re.I,
+)
+# hex-хеши md5/sha1/sha256 в поле password
+HEX_HASH_RE = re.compile(r'^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$')
+# закодированный блоб (base64 >= 100 символов) вместо пароля
+ENCODED_BLOB_RE = re.compile(r'^[A-Za-z0-9+/=_-]{100,}$')
 # Дата вида 2026-10-17
 DATE_VALUE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
@@ -318,6 +334,15 @@ SEVERITY_MAP = {
     "telegram_bot_valid": "HIGH",
     "telegram_bot_money": "CRITICAL",
     "aws_key_valid": "HIGH",
+    "stripe_key_valid": "CRITICAL",
+    "slack_token_valid": "HIGH",
+    "discord_token_valid": "HIGH",
+    "github_token_valid": "HIGH",
+    "gitlab_token_valid": "HIGH",
+    "mailgun_key_valid": "HIGH",
+    "sendgrid_key_valid": "HIGH",
+    "npm_token_valid": "MEDIUM",
+    "dropbox_token_valid": "HIGH",
     "dsn_reachable": "MEDIUM",
     "dsn_auth_ok": "CRITICAL",
     "slack_token": "HIGH",
@@ -404,7 +429,11 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     if is_masked_value(val) or is_placeholder_value(field, val):
                         continue  # placeholder - проверяем следующие вхождения
                     if HASHED_PASSWORD_RE.match(val):
-                        continue  # хеш пароля, не plaintext
+                        continue  # хеш пароля (вкл. сырой $2a$/$argon2), не plaintext
+                    if HEX_HASH_RE.match(val):
+                        continue  # md5/sha1/sha256 хеш
+                    if ENCODED_BLOB_RE.match(val):
+                        continue  # закодированный блоб (base64), не пароль
 
             # Токены: отсеиваем мусорные значения (fake_, даты, без цифр)
             if name in ("refresh_token", "auth_token", "bearer_token", "access_token", "session_id", "session_token"):
@@ -527,6 +556,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             telegram_bots_found: set[str] = set()
             aws_keypairs_found: set[tuple[str, str]] = set()
             dsns_found: set[str] = set()
+            secrets_found: set[tuple[str, str]] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -610,6 +640,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         d for d in extract_dsns(body[:100_000])
                                         if not is_placeholder_dsn(d)
                                     )
+                                if cfg.secret_checks:
+                                    secrets_found.update(extract_secrets(body[:100_000]))
 
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
@@ -718,6 +750,24 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(max_severity, 0) < 1:
                             max_severity = "MEDIUM"
 
+            # Проверка сервисных секретов: stripe (баланс!), slack, discord,
+            # github, gitlab, mailgun, sendgrid, npm, dropbox (read-only)
+            secret_checks: list[dict[str, Any]] = []
+            if cfg.secret_checks and secrets_found:
+                for kind, val in list(secrets_found)[: cfg.secret_max]:
+                    chk = await verify_secret(
+                        session, kind, val,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    secret_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append(f"{kind}_key_valid"
+                                             if kind in ("stripe", "mailgun", "sendgrid")
+                                             else f"{kind}_token_valid")
+                        sev = SEVERITY_MAP.get(all_patterns[-1], "HIGH")
+                        if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
+                            max_severity = sev
+
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))
             result.severity = max_severity
@@ -753,6 +803,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "telegram_checks": telegram_checks,
                 "aws_key_checks": aws_key_checks,
                 "dsn_checks": dsn_checks,
+                "secret_checks": secret_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
