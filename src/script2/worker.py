@@ -105,6 +105,15 @@ class Worker:
                         chk.get("provider"),
                         chk.get("detail") or "",
                     )
+            for chk in result.data.get("telegram_checks") or []:
+                if chk.get("status") == "valid":
+                    log.info(
+                        "TELEGRAM_BOT_VALID id=%d ip=%s:%d bot=@%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("username") or "?",
+                    )
         else:
             self.done_dead += 1
 

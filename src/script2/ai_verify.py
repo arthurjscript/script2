@@ -93,7 +93,53 @@ async def verify_ai_key(
                             )
                     except Exception:
                         pass
-            elif resp.status in (401, 403):
+            elif resp.status in (401, 403) or (resp.status == 400 and provider == "gemini"):
+                # Gemini отдаёт 400 для невалидных API-ключей
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["status"] = "error"
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# Telegram bot tokens: id:hash
+TELEGRAM_BOT_RE = re.compile(r'\b(\d{8,10}):([A-Za-z0-9_-]{35})\b')
+
+
+def extract_telegram_bots(text: str) -> list[str]:
+    """Извлекает токены telegram-ботов из текста ответа."""
+    return list(dict.fromkeys(m.group(0) for m in TELEGRAM_BOT_RE.finditer(text)))
+
+
+async def verify_telegram_bot(
+    session: aiohttp.ClientSession,
+    token: str,
+    proxy: str | None = None,
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """Проверяет бота через getMe (бесплатно и безопасно)."""
+    result: dict[str, Any] = {"token": token, "status": "error", "username": ""}
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with session.get(
+            f"https://api.telegram.org/bot{token}/getMe",
+            proxy=proxy,
+            timeout=timeout,
+        ) as resp:
+            if resp.status == 200:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {}
+                if data.get("ok"):
+                    result["status"] = "valid"
+                    result["username"] = data.get("result", {}).get("username", "")
+                else:
+                    result["status"] = "invalid"
+            elif resp.status in (401, 404):
                 result["status"] = "invalid"
                 result["detail"] = f"HTTP {resp.status}"
             else:

@@ -11,7 +11,12 @@ from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
 
-from .ai_verify import extract_ai_keys, verify_ai_key
+from .ai_verify import (
+    extract_ai_keys,
+    extract_telegram_bots,
+    verify_ai_key,
+    verify_telegram_bot,
+)
 from .config import Settings
 from .models import HostRow, CheckResult
 
@@ -241,6 +246,7 @@ SEVERITY_MAP = {
     "github_token": "HIGH",
     "gitlab_token": "HIGH",
     "telegram_bot": "HIGH",
+    "telegram_bot_valid": "HIGH",
     "slack_token": "HIGH",
     "discord_token": "HIGH",
     "discord_webhook": "MEDIUM",
@@ -440,6 +446,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
             # AI-ключи, найденные в ответах (key -> provider), для верификации
             ai_keys_found: dict[str, str] = {}
+            telegram_bots_found: set[str] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -497,10 +504,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
-                                # Собираем AI-ключи для проверки баланса
+                                # Собираем AI-ключи и telegram-ботов для проверки
                                 if cfg.ai_key_checks:
                                     for prov, k in extract_ai_keys(body[:100_000]):
                                         ai_keys_found.setdefault(k, prov)
+                                if cfg.telegram_bot_checks:
+                                    telegram_bots_found.update(extract_telegram_bots(body[:100_000]))
 
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
@@ -554,6 +563,20 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(max_severity, 0) < 2:
                             max_severity = "HIGH"
 
+            # Проверка telegram-ботов: жив ли бот (getMe, через прокси)
+            telegram_checks: list[dict[str, Any]] = []
+            if cfg.telegram_bot_checks and telegram_bots_found:
+                for token in list(telegram_bots_found)[: cfg.telegram_bot_max]:
+                    chk = await verify_telegram_bot(
+                        session, token,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    telegram_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("telegram_bot_valid")
+                        if severity_order.get(max_severity, 0) < 2:
+                            max_severity = "HIGH"
+
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))
             result.severity = max_severity
@@ -584,6 +607,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "vulnerable": vulnerable_eps,
                 "withdraw_capable": bool(withdraw_eps),
                 "ai_key_checks": ai_key_checks,
+                "telegram_checks": telegram_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

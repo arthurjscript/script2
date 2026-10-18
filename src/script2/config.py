@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     ai_key_checks: bool = True
     ai_key_max: int = 5
 
+    # Telegram bot verification (getMe)
+    telegram_bot_checks: bool = True
+    telegram_bot_max: int = 5
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""
