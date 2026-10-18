@@ -218,7 +218,10 @@ async def verify_ai_key(
 
 
 # Telegram bot tokens: id:hash
-TELEGRAM_BOT_RE = re.compile(r'\b(\d{8,10}):([A-Za-z0-9_-]{35})\b')
+# (?<!\d): id не может быть хвостом более длинного числа
+# (напр. ig_version "1781452849827659916:69b77f04..." — не токен);
+# (?![A-Za-z0-9_-]): секрет ровно 35 символов (не префикс hex-блоба)
+TELEGRAM_BOT_RE = re.compile(r'(?<!\d)(\d{8,10}):([A-Za-z0-9_-]{35})(?![A-Za-z0-9_-])')
 
 
 def extract_telegram_bots(text: str) -> list[str]:

@@ -187,7 +187,7 @@ SENSITIVE_PATTERNS = {
     "facebook_access_token": re.compile(r'"(?:access_token|page_access_token)"\s*:\s*"(EAA[A-Za-z0-9]{50,})"'),
     "github_token": re.compile(r'gh[ps]_[A-Za-z0-9]{36,}'),
     "gitlab_token": re.compile(r'glpat-[A-Za-z0-9\-]{20,}'),
-    "telegram_bot": re.compile(r'\d{8,10}:[A-Za-z0-9_-]{35}'),
+    "telegram_bot": re.compile(r'(?<!\d)\d{8,10}:[A-Za-z0-9_-]{35}(?![A-Za-z0-9_-])'),
     "slack_token": re.compile(r'xox[baprs]-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24}'),
     "discord_token": re.compile(r'\b[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{25,}\b'),
     "discord_webhook": re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+'),
