@@ -100,12 +100,29 @@ SENSITIVE_PATTERNS = {
     # CRITICAL - прямые деньги
     "password": re.compile(r'"(?:password|passwd|email_password|user_password)"\s*:\s*"([^"]{3,})"', re.I),
     "private_key_pem": re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
-    "evm_private_key": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"'),
-    "bitcoin_wif": re.compile(r'"(?:private_key|wif|priv)"\s*:\s*"[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"'),
+    # EVM/Tron private key: 64 hex (0x или без) в поле приватного ключа.
+    # Широкий охват имён: private_key, PRIVATE_KEY, privateKey, evm_private_key,
+    # walletPrivateKey, tron_private_key, owner_key, signer_key, deployer_key,
+    # keeper_key, hot_wallet_key, pk — без привязки к регистру
+    "evm_private_key": re.compile(
+        r'"(?:[^"]{0,32}(?:priv|wallet|owner|signer|evm|eth|tron|deployer|keeper|hot|funder)[^"]{0,24}key|pk)"'
+        r'\s*:\s*"(?:0x)?[0-9a-fA-F]{64}"', re.I),
+    # Bitcoin WIF (base58, 5/K/L): поле с wif/priv в имени
+    "bitcoin_wif": re.compile(
+        r'"[^"]{0,24}(?:wif|priv)[^"]{0,20}"\s*:\s*"[5KL][1-9A-HJ-NP-Za-km-z]{50,51}"', re.I),
     "extended_key": re.compile(r'\b(xprv|yprv|zprv|tprv)[1-9A-HJ-NP-Za-km-z]{50,}\b'),
-    "solana_key": re.compile(r'"(?:private_key|secret_key|solana_key)"\s*:\s*"[1-9A-HJ-NP-Za-km-z]{87,88}"'),
-    # seed_phrase: 12+ слов через пробел (BIP-39)
-    "seed_phrase": re.compile(r'"(?:seed|seed_phrase|seedphrase|mnemonic|backup_phrase|recovery_phrase)"\s*:\s*"([a-z]+(?:\s+[a-z]+){11,})"', re.I),
+    # Solana secret key: base58 87-88 символов в поле priv/secret/solana/wallet+key
+    "solana_key": re.compile(
+        r'"[^"]{0,32}(?:priv|secret|solana|wallet)[^"]{0,24}key"\s*:\s*"[1-9A-HJ-NP-Za-km-z]{87,88}"',
+        re.I),
+    # Solana keypair: байтовый массив из 64 чисел (формат solana CLI/Phantom);
+    # контекст кошелька проверяется в classify_response
+    "solana_keypair": re.compile(
+        r'\[\s*(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\s*,\s*){63}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\s*\]'),
+    # seed_phrase: 12+ слов (BIP-39), поле с seed/mnemonic/recovery/backup в имени
+    "seed_phrase": re.compile(
+        r'"[^"]{0,24}(?:seed|mnemonic|recovery|backup)[^"]{0,24}"\s*:\s*"([a-z]+(?:\s+[a-z]+){11,})"',
+        re.I),
     # secret_key: hex формат 32+ символов
     "secret_key": re.compile(r'"(?:secret_key|master_key|secretKey)"\s*:\s*"[0-9a-fA-F]{32,}"'),
     # otp_secret: base32 формат (A-Z, 2-7)
@@ -194,7 +211,10 @@ SENSITIVE_PATTERNS = {
 
     # Crypto wallets and keys
     "wallet_address": re.compile(r'"(?:wallet_address|wallet|address)"\s*:\s*"(?:0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|[1-9A-HJ-NP-Za-km-z]{32,44})"'),
-    "private_key_generic": re.compile(r'"(?:private_key|privateKey|privKey|priv_key)"\s*:\s*"[^"]{20,}"', re.I),
+    # Любое приватное значение в приватном поле (base64/b58/строки) — широкий охват
+    "private_key_generic": re.compile(
+        r'"(?:[^"]{0,32}(?:priv|wallet|evm|eth|tron|signer|keeper)[^"]{0,24}key|privateKey)"\s*:\s*"[^"]{20,}"',
+        re.I),
 }
 
 # Маскированные значения (игнорируем)
@@ -321,6 +341,7 @@ SEVERITY_MAP = {
     "bitcoin_wif": "CRITICAL",
     "extended_key": "CRITICAL",
     "solana_key": "CRITICAL",
+    "solana_keypair": "CRITICAL",
     "seed_phrase": "CRITICAL",
     "secret_key": "CRITICAL",
     "otp_secret": "CRITICAL",
@@ -482,6 +503,13 @@ def classify_response(body: str) -> tuple[list[str], str]:
             # Для DSN проверяем что не placeholder
             if name.endswith("_dsn") and is_placeholder_dsn(value_text):
                 continue
+
+            # solana_keypair: массив 64 байт считаем ключом только рядом
+            # с контекстом кошелька (иначе ловим любые числовые массивы)
+            if name == "solana_keypair":
+                ctx = body[max(0, m.start() - 300):m.start() + 300].lower()
+                if not re.search(r'solana|wallet|keypair|secret|privat', ctx):
+                    continue
 
             matched = True
             break
