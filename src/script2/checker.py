@@ -841,11 +841,13 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     ep_data["verdict"] = "PUBLIC_OK"
                                     result.public_count += 1
 
-                                # Сохраняем JSON ответ (до 50KB) только для важных
+                                # Сохраняем ответ только для важных эндпоинтов.
+                                # JSON парсим целиком: срез body[:50_000] ломал
+                                # валидный JSON посередине (обрезанный ответ в панели)
                                 if patterns:
                                     try:
-                                        ep_data["response"] = json.loads(body[:50_000])
-                                    except json.JSONDecodeError:
+                                        ep_data["response"] = json.loads(body)
+                                    except (json.JSONDecodeError, ValueError):
                                         ep_data["response"] = body[:50_000]
 
                             elif resp.status in (401, 403):
