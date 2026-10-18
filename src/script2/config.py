@@ -41,9 +41,17 @@ class Settings(BaseSettings):
     ai_key_checks: bool = True
     ai_key_max: int = 5
 
-    # Telegram bot verification (getMe)
+    # Telegram bot verification (getMe + платёжные команды)
     telegram_bot_checks: bool = True
     telegram_bot_max: int = 5
+
+    # AWS key verification (STS GetAccessKeyInfo, без подписи)
+    aws_key_checks: bool = True
+    aws_key_max: int = 3
+
+    # DSN reachability/auth check (TCP + postgres login)
+    dsn_checks: bool = True
+    dsn_max: int = 3
 
     # Proxy
     proxy_file: str = ""

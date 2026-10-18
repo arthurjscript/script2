@@ -107,12 +107,49 @@ class Worker:
                     )
             for chk in result.data.get("telegram_checks") or []:
                 if chk.get("status") == "valid":
-                    log.info(
-                        "TELEGRAM_BOT_VALID id=%d ip=%s:%d bot=@%s",
+                    if chk.get("money"):
+                        log.warning(
+                            "TELEGRAM_BOT_MONEY id=%d ip=%s:%d bot=@%s commands=%s",
+                            row.id,
+                            row.host,
+                            row.port,
+                            chk.get("username") or "?",
+                            ",".join(chk.get("money_commands") or []),
+                        )
+                    else:
+                        log.info(
+                            "TELEGRAM_BOT_VALID id=%d ip=%s:%d bot=@%s",
+                            row.id,
+                            row.host,
+                            row.port,
+                            chk.get("username") or "?",
+                        )
+            for chk in result.data.get("aws_key_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "AWS_KEY_VALID id=%d ip=%s:%d account=%s arn=%s",
                         row.id,
                         row.host,
                         row.port,
-                        chk.get("username") or "?",
+                        chk.get("account") or "?",
+                        chk.get("arn") or "?",
+                    )
+            for chk in result.data.get("dsn_checks") or []:
+                if chk.get("status") == "auth_ok":
+                    log.warning(
+                        "DSN_AUTH_OK id=%d ip=%s:%d dsn=%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("dsn"),
+                    )
+                elif chk.get("status") == "reachable":
+                    log.info(
+                        "DSN_REACHABLE id=%d ip=%s:%d dsn=%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("dsn"),
                     )
         else:
             self.done_dead += 1

