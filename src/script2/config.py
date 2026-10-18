@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     cryptopay_checks: bool = True
     cryptopay_max: int = 3
 
+    # WordPress finder: wp_user/wp_password из тел + активный пробер /api/sites,
+    # верификация read-only GET /wp-json/wp/v2/users/me (Basic, app passwords)
+    wp_checks: bool = True
+    wp_verify_max: int = 10
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""

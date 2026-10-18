@@ -142,6 +142,17 @@ class Worker:
                         chk.get("kind"),
                         chk.get("detail") or "",
                     )
+            for chk in result.data.get("wp_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "WP_ADMIN_VALID id=%d ip=%s:%d site=%s user=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("site") or "?",
+                        chk.get("user") or "?",
+                        chk.get("detail") or "",
+                    )
             for chk in result.data.get("twilio_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

