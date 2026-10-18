@@ -30,6 +30,9 @@ KEY_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     ("deepseek", re.compile(r'\bsk-[0-9a-f]{32}\b')),
     # fireworks.ai: есть некенсурированные модели (dolphin и др.)
     ("fireworks", re.compile(r'\bfw_[A-Za-z0-9]{20,40}\b')),
+    # fish.audio (TTS): ключ вида sk-fish-... с дефисами — generic openai-паттерн
+    # его не берёт (там только [A-Za-z0-9])
+    ("fish", re.compile(r'\bsk-fish-[A-Za-z0-9_-]{20,}')),
 ]
 
 # Провайдеры, у которых есть модели без цензуры (dolphin/hermes/llama-uncensored
@@ -49,6 +52,8 @@ PROVIDER_URLS = {
     "fireworks": "https://api.fireworks.ai/inference/v1/models",
     # together.ai: ключ = 64 hex, формат неуникальный — извлекаем по контексту
     "together": "https://api.together.xyz/v1/models",
+    # fish.audio (TTS): /wallet/self/api-credit сам проверяет ключ и отдаёт остаток
+    "fish": "https://api.fish.audio/wallet/self/api-credit",
 }
 
 
@@ -146,7 +151,7 @@ async def verify_ai_key(
     """Проверяет ключ: valid / invalid / error + детали.
 
     Детали: доступные модели (в ответе верификации, без доп. запросов),
-    баланс deepseek, limit/usage openrouter.
+    баланс deepseek, limit/usage openrouter, кредит fish.audio.
     """
     result: dict[str, Any] = {
         "provider": provider,
@@ -192,6 +197,14 @@ async def verify_ai_key(
                             )
                     except Exception:
                         pass
+                elif provider == "fish":
+                    # /wallet/self/api-credit: credit = остаток денег на TTS
+                    credit = (data or {}).get("credit")
+                    free = (data or {}).get("has_free_credit")
+                    if credit is not None:
+                        result["detail"] = f"кредит {credit}"
+                        if free:
+                            result["detail"] += " (есть free-кредит)"
                 else:
                     # доступные модели из того же ответа (без доп. запросов)
                     result["detail"] = _models_summary(data)
