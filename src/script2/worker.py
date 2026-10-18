@@ -153,6 +153,16 @@ class Worker:
                         chk.get("user") or "?",
                         chk.get("detail") or "",
                     )
+            for chk in result.data.get("integration_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "INTEGRATION_VALID id=%d ip=%s:%d service=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("service") or "?",
+                        chk.get("detail") or "",
+                    )
             for chk in result.data.get("twilio_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

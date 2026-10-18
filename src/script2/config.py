@@ -92,6 +92,11 @@ class Settings(BaseSettings):
     id_fuzz_templates_max: int = 10
     id_fuzz_rounds: int = 5
 
+    # Интеграционные токены панелей (service_type+api_key): Bearer-проба
+    # известных сервисов (clickadu balance, clickadilla profile, cloudflare)
+    integration_checks: bool = True
+    integration_verify_max: int = 10
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""
