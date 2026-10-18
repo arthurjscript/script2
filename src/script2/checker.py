@@ -410,6 +410,8 @@ HEX_HASH_RE = re.compile(r'^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$
 ENCODED_BLOB_RE = re.compile(r'^[A-Za-z0-9+/=_-]{100,}$')
 # Дата вида 2026-10-17
 DATE_VALUE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+# UUID (анонимные сессии/аналитика выдают UUID в session_id — это не утечка)
+UUID_VALUE_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
 
 
 def is_junk_token_value(val: str) -> bool:
@@ -570,6 +572,10 @@ def classify_response(body: str) -> tuple[list[str], str]:
             if name in ("refresh_token", "auth_token", "bearer_token", "access_token", "session_id", "session_token"):
                 tok_match = re.search(r':\s*"([^"]*)"', value_text)
                 if tok_match and is_junk_token_value(tok_match.group(1)):
+                    continue
+                # UUID-значения session-полей — анонимная сессия или аналитика
+                # (сервер выдал новую сессию для запроса), не утечка
+                if tok_match and name in ("session_id", "session_token") and UUID_VALUE_RE.match(tok_match.group(1)):
                     continue
 
             # credential: пропускаем не-секретные значения (дипломы, описания)
