@@ -33,6 +33,8 @@ KEY_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     # fish.audio (TTS): ключ вида sk-fish-... с дефисами — generic openai-паттерн
     # его не берёт (там только [A-Za-z0-9])
     ("fish", re.compile(r'\bsk-fish-[A-Za-z0-9_-]{20,}')),
+    # kling: доступ по JWT из пары access_key+secret_key — ловим саму пару (см. extract_ai_keys)
+    # seedance: API-ключ Volcengine Ark (модели Seedance/Doubao) — ключ с контекстом
 ]
 
 # Провайдеры, у которых есть модели без цензуры (dolphin/hermes/llama-uncensored
@@ -54,6 +56,8 @@ PROVIDER_URLS = {
     "together": "https://api.together.xyz/v1/models",
     # fish.audio (TTS): /wallet/self/api-credit сам проверяет ключ и отдаёт остаток
     "fish": "https://api.fish.audio/wallet/self/api-credit",
+    # seedance: ключ Volcengine Ark — модели видео-генерации Seedance/Doubao
+    "seedance": "https://ark.cn-beijing.volces.com/api/v3/models",
 }
 
 
@@ -74,6 +78,25 @@ def extract_ai_keys(text: str) -> list[tuple[str, str]]:
         if km and km.group(1) not in seen:
             seen.add(km.group(1))
             found.append(("together", km.group(1)))
+            break
+    # kling: JWT строится из пары access_key+secret_key — ловим пару рядом
+    for m in re.finditer(r'(?i)kling', text):
+        window = text[max(0, m.start() - 300): m.start() + 500]
+        am = re.search(r'"(?:access_?key|ak)"\s*:\s*"([A-Za-z0-9_\-]{8,64})"', window)
+        sm = re.search(r'"(?:secret_?key|sk)"\s*:\s*"([A-Za-z0-9_\-]{8,64})"', window)
+        if am and sm and am.group(1) not in seen:
+            seen.add(am.group(1))
+            found.append(("kling", f'{am.group(1)}:{sm.group(1)}'))
+            break
+    # seedance/volcengine ark: UUID-ключ рядом с ark/seedance/doubao-контекстом
+    for m in re.finditer(r'(?i)(?:seedance|volces|ark\.cn-beijing|doubao)', text):
+        window = text[max(0, m.start() - 200): m.start() + 400]
+        km = re.search(
+            r'"(?:ark[-_ ]?api[-_ ]?key|api[_-]?key|apiKey)"\s*:\s*"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"',
+            window, re.I)
+        if km and km.group(1) not in seen:
+            seen.add(km.group(1))
+            found.append(("seedance", km.group(1)))
             break
     return found
 
@@ -141,6 +164,55 @@ async def _xai_models(
     return ""
 
 
+def _kling_jwt(ak: str, sk: str) -> str:
+    """JWT для авторизации kling: HS256, iss=access_key, окно exp/nbf 30 мин."""
+    def b64url(b: bytes) -> str:
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    now = int(time.time())
+    header = b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = b64url(json.dumps({"iss": ak, "exp": now + 1800, "nbf": now - 5}, separators=(",", ":")).encode())
+    sig = b64url(hmac.new(sk.encode(), f"{header}.{payload}".encode(), hashlib.sha256).digest())
+    return f"{header}.{payload}.{sig}"
+
+
+async def _verify_kling(
+    session: aiohttp.ClientSession, key: str,
+    proxy: str | None, timeout_s: float,
+) -> dict[str, Any]:
+    """Проверка kling: GET несуществующей задачи — без списаний.
+
+    Валидная пара ak/sk проходит авторизацию (ответ про отсутствие задачи),
+    битая — "access key not found". Задача не создаётся.
+    """
+    result: dict[str, Any] = {
+        "provider": "kling", "key": key, "status": "error", "detail": "", "uncensored": False,
+    }
+    try:
+        ak, sk = key.split(":", 1)
+    except ValueError:
+        result["detail"] = "bad pair"
+        return result
+    try:
+        url = "https://api.klingai.com/v1/videos/text2video/00000000-0000-0000-0000-000000000000"
+        async with session.get(
+            url, headers={"Authorization": f"Bearer {_kling_jwt(ak, sk)}"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            body = await resp.text()
+            low = body.lower()
+            if resp.status == 401 or "access key not found" in low or "signature" in low:
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            elif resp.status < 400:
+                result["status"] = "valid"
+                result["detail"] = "ключ активен"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
 async def verify_ai_key(
     session: aiohttp.ClientSession,
     provider: str,
@@ -153,6 +225,8 @@ async def verify_ai_key(
     Детали: доступные модели (в ответе верификации, без доп. запросов),
     баланс deepseek, limit/usage openrouter, кредит fish.audio.
     """
+    if provider == "kling":
+        return await _verify_kling(session, key, proxy, timeout_s)
     result: dict[str, Any] = {
         "provider": provider,
         "key": key,
