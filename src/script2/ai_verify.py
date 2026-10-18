@@ -73,6 +73,69 @@ def extract_ai_keys(text: str) -> list[tuple[str, str]]:
     return found
 
 
+def _models_summary(data: Any) -> str:
+    """Краткая сводка доступных моделей из ответа /models.
+
+    Понимает openai-совместимый формат ({"data": [{"id": ...}]}) и
+    gemini ({"models": [{"name": "models/..."}]}).
+    """
+    models: Any = []
+    if isinstance(data, dict):
+        models = data.get("data") or data.get("models") or []
+    names: list[str] = []
+    for m in models:
+        if isinstance(m, dict):
+            mid = m.get("id") or m.get("name") or ""
+            if mid:
+                names.append(str(mid).removeprefix("models/"))
+    if not names:
+        return ""
+    sample = ", ".join(names[:3])
+    return f"{len(names)} моделей: {sample}" + ("…" if len(names) > 3 else "")
+
+
+async def _deepseek_balance(
+    session: aiohttp.ClientSession, key: str,
+    proxy: str | None, timeout_s: float,
+) -> str:
+    """Баланс на deepseek-ключе (сколько денег доступно)."""
+    try:
+        async with session.get(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {key}"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                parts = [
+                    f"баланс {b.get('total_balance')} {b.get('currency')}"
+                    for b in (data.get("balance_infos") or [])
+                    if b.get("total_balance")
+                ]
+                return " | ".join(parts)
+    except (aiohttp.ClientError, TimeoutError, OSError):
+        pass
+    return ""
+
+
+async def _xai_models(
+    session: aiohttp.ClientSession, key: str,
+    proxy: str | None, timeout_s: float,
+) -> str:
+    """Доступные grok-модели (xai верифицируется через /api-key, не /models)."""
+    try:
+        async with session.get(
+            "https://api.x.ai/v1/models",
+            headers={"Authorization": f"Bearer {key}"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                return _models_summary(await resp.json(content_type=None))
+    except (aiohttp.ClientError, TimeoutError, OSError):
+        pass
+    return ""
+
+
 async def verify_ai_key(
     session: aiohttp.ClientSession,
     provider: str,
@@ -80,7 +143,11 @@ async def verify_ai_key(
     proxy: str | None = None,
     timeout_s: float = 5.0,
 ) -> dict[str, Any]:
-    """Проверяет ключ: valid / invalid / error + детали (баланс, где отдаётся)."""
+    """Проверяет ключ: valid / invalid / error + детали.
+
+    Детали: доступные модели (в ответе верификации, без доп. запросов),
+    баланс deepseek, limit/usage openrouter.
+    """
     result: dict[str, Any] = {
         "provider": provider,
         "key": key,
@@ -105,22 +172,29 @@ async def verify_ai_key(
         ) as resp:
             if resp.status in (200, 201):
                 result["status"] = "valid"
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = None
                 if provider == "openrouter":
                     try:
-                        data = (await resp.json()).get("data", {})
-                        limit = data.get("limit")
+                        od = (data or {}).get("data", {})
+                        limit = od.get("limit")
                         if limit is None:
                             result["detail"] = (
-                                f"free_tier={data.get('is_free_tier')} "
-                                f"spent={data.get('usage')}"
+                                f"free_tier={od.get('is_free_tier')} "
+                                f"spent={od.get('usage')}"
                             )
                         else:
                             result["detail"] = (
-                                f"limit={limit} spent={data.get('usage')} "
-                                f"free_tier={data.get('is_free_tier')}"
+                                f"limit={limit} spent={od.get('usage')} "
+                                f"free_tier={od.get('is_free_tier')}"
                             )
                     except Exception:
                         pass
+                else:
+                    # доступные модели из того же ответа (без доп. запросов)
+                    result["detail"] = _models_summary(data)
             elif resp.status in (401, 403) or (resp.status == 400 and provider == "gemini"):
                 # Gemini отдаёт 400 для невалидных API-ключей
                 result["status"] = "invalid"
@@ -128,6 +202,16 @@ async def verify_ai_key(
             else:
                 result["status"] = "error"
                 result["detail"] = f"HTTP {resp.status}"
+
+        # Доп. read-only запросы только для валидных ключей
+        if result["status"] == "valid":
+            extra = ""
+            if provider == "deepseek":
+                extra = await _deepseek_balance(session, key, proxy, timeout_s)
+            elif provider == "xai":
+                extra = await _xai_models(session, key, proxy, timeout_s)
+            if extra:
+                result["detail"] = f"{result['detail']} | {extra}".strip(" |")
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
         result["detail"] = type(exc).__name__
     return result
