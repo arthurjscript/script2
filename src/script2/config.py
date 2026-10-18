@@ -59,6 +59,18 @@ class Settings(BaseSettings):
     # Discord: max tokens per host, чтобы не ловить rate-limit от API
     discord_verify_max: int = 5
 
+    # Twilio AccountSid+AuthToken pair (HTTP Basic, read-only)
+    twilio_checks: bool = True
+    twilio_max: int = 3
+
+    # Twitter/X app bearer (context extraction, read-only)
+    twitter_checks: bool = True
+    twitter_max: int = 2
+
+    # Exchange API keypairs: binance/bybit/okx/kucoin (HMAC, баланс+вывод)
+    exchange_checks: bool = True
+    exchange_max: int = 3
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""

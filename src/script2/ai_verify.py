@@ -4,7 +4,12 @@
 Все проверки бесплатны и безопасны (без списания средств, read-only).
 """
 import asyncio
+import base64
+import hashlib
+import hmac
 import re
+import time
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -616,5 +621,312 @@ async def verify_secret(
         else:
             result["detail"] = f"unknown kind {kind}"
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Twilio: пара AccountSid (AC/SK) + AuthToken, HTTP Basic (read-only)
+# ---------------------------------------------------------------------------
+TWILIO_PAIR_RE = re.compile(
+    r'"(?:twilioAccountSid|accountSid|account_sid|twilio_sid)"\s*:\s*"((?:SK|AC)[0-9a-fA-F]{32})"'
+    r'[^{}]{0,400}?'
+    r'"(?:twilioAuthToken|authToken|auth_token|twilio_auth_token)"\s*:\s*"([A-Za-z0-9]{32})"')
+TWILIO_PAIR_RE_R = re.compile(
+    r'"(?:twilioAuthToken|authToken|auth_token|twilio_auth_token)"\s*:\s*"([A-Za-z0-9]{32})"'
+    r'[^{}]{0,400}?'
+    r'"(?:twilioAccountSid|accountSid|account_sid|twilio_sid)"\s*:\s*"((?:SK|AC)[0-9a-fA-F]{32})"')
+
+
+def extract_twilio_pairs(text: str) -> list[tuple[str, str]]:
+    """(sid, token) пары Twilio из JSON-подобного текста."""
+    pairs: list[tuple[str, str]] = []
+    for m in TWILIO_PAIR_RE.finditer(text):
+        if (m.group(1), m.group(2)) not in pairs:
+            pairs.append((m.group(1), m.group(2)))
+    for m in TWILIO_PAIR_RE_R.finditer(text):
+        if (m.group(2), m.group(1)) not in pairs:
+            pairs.append((m.group(2), m.group(1)))
+    return pairs
+
+
+async def verify_twilio_pair(session: aiohttp.ClientSession, sid: str,
+                             token: str, proxy: str | None = None,
+                             timeout_s: float = 5.0) -> dict[str, Any]:
+    """Twilio REST API = HTTP Basic sid:token, GET Accounts.json (read-only)."""
+    result: dict[str, Any] = {"sid": sid[:10] + "…", "status": "unknown", "detail": ""}
+    try:
+        async with session.get(
+            "https://api.twilio.com/2010-04-01/Accounts.json?PageSize=1",
+            auth=aiohttp.BasicAuth(sid, token),
+            proxy=proxy, timeout=timeout_s,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                accs = data.get("accounts") or [{}]
+                result["status"] = "valid"
+                result["detail"] = str(accs[0].get("friendly_name") or accs[0].get("status") or "?")
+            elif resp.status == 401:
+                result["status"] = "invalid"
+                result["detail"] = "HTTP 401"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Twitter/X: app-only bearer токен (контекстное извлечение)
+# ---------------------------------------------------------------------------
+def extract_twitter_bearers(text: str, limit: int = 2) -> list[str]:
+    """Bearer AAAAAAAA… рядом со словом twitter (контекст отсекает base64-мусор)."""
+    out: list[str] = []
+    for m in re.finditer(r'(?i)twitter', text):
+        window = text[max(0, m.start() - 250): m.start() + 350]
+        b = re.search(r'\b(A{10}[A-Za-z0-9%]{30,})', window)
+        if b and b.group(1).rstrip("%") not in out:
+            # % в хвосте — артефакт url-encoding, twitter на нём отдаёт 500
+            out.append(b.group(1).rstrip("%"))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def verify_twitter_bearer(session: aiohttp.ClientSession, token: str,
+                               proxy: str | None = None,
+                               timeout_s: float = 5.0) -> dict[str, Any]:
+    """GET rate_limit_status работает с app-only bearer, квоту не тратит."""
+    result: dict[str, Any] = {"status": "unknown", "detail": ""}
+    try:
+        async with session.get(
+            "https://api.twitter.com/1.1/application/rate_limit_status.json",
+            headers={"Authorization": f"Bearer {token}"},
+            proxy=proxy, timeout=timeout_s,
+        ) as resp:
+            if resp.status in (200, 429):  # 429 = токен валиден, лимит исчерпан
+                result["status"] = "valid"
+                result["detail"] = "app bearer"
+            elif resp.status in (400, 401, 403):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Биржевые API-ключи: binance/bybit/okx/kucoin (HMAC-подпись, read-only:
+# баланс + право вывода — связка «сколько денег лежит и можно ли вывести»)
+# ---------------------------------------------------------------------------
+EXCHANGE_CTX_RE = re.compile(r'(?i)\b(binance|bybit|okx|kucoin)\b')
+_EX_KEY_RE = re.compile(
+    r'"(?:api[_-]?key|apiKey|api[_-]?id|access[_-]?key|exchange[_-]?key)"\s*:\s*"([A-Za-z0-9]{16,64})"', re.I)
+_EX_SECRET_RE = re.compile(
+    r'"(?:api[_-]?secret|apiSecret|secret(?:[_-]?key)?)"\s*:\s*"([A-Za-z0-9+/=_-]{16,64})"', re.I)
+_EX_PASS_RE = re.compile(r'"(?:passphrase|pass_phrase)"\s*:\s*"([^"]{6,64})"', re.I)
+
+
+def extract_exchange_pairs(text: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Пары api_key+secret (для okx/kucoin + passphrase) рядом с названием биржи."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for m in EXCHANGE_CTX_RE.finditer(text):
+        window = text[max(0, m.start() - 600): m.start() + 900]
+        km = _EX_KEY_RE.search(window)
+        sm = _EX_SECRET_RE.search(window)
+        if not (km and sm) or km.group(1) == sm.group(1):
+            continue
+        pm = _EX_PASS_RE.search(window)
+        exchange = m.group(1).lower()
+        sig = (exchange, km.group(1), sm.group(1))
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append({"exchange": exchange, "key": km.group(1), "secret": sm.group(1),
+                   "passphrase": pm.group(1) if pm else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _hmac_hex(secret: str, msg: str) -> str:
+    return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+
+def _hmac_b64(secret: bytes, msg: str) -> str:
+    return base64.b64encode(hmac.new(secret, msg.encode(), hashlib.sha256).digest()).decode()
+
+
+def _ex_error(status: int) -> dict[str, Any]:
+    return {"status": "invalid" if status in (400, 401, 403) else "unknown",
+            "detail": f"HTTP {status}", "balances": [], "withdraw_enabled": None}
+
+
+async def _verify_binance(session: aiohttp.ClientSession, key: str, secret: str,
+                          proxy: str | None, timeout_s: float) -> dict[str, Any]:
+    headers = {"X-MBX-APIKEY": key}
+    q = f"timestamp={int(time.time() * 1000)}&recvWindow=5000"
+    async with session.get(
+        f"https://api.binance.com/api/v3/account?{q}&signature={_hmac_hex(secret, q)}",
+        headers=headers, proxy=proxy, timeout=timeout_s,
+    ) as resp:
+        if resp.status != 200:
+            return _ex_error(resp.status)
+        data = await resp.json()
+        balances = [
+            f"{b['asset']}={float(b['free'] or 0) + float(b['locked'] or 0):.6g}"
+            for b in data.get("balances") or []
+            if float(b.get("free") or 0) + float(b.get("locked") or 0) > 0
+        ]
+    # Права ключа: enableWithdrawals (sapi может быть выключен — не критично)
+    q2 = f"timestamp={int(time.time() * 1000)}&recvWindow=5000"
+    withdraw: bool | None = None
+    try:
+        async with session.get(
+            f"https://api.binance.com/sapi/v1/account/apiRestrictions?{q2}&signature={_hmac_hex(secret, q2)}",
+            headers=headers, proxy=proxy, timeout=timeout_s,
+        ) as resp:
+            if resp.status == 200:
+                withdraw = bool((await resp.json()).get("enableWithdrawals"))
+    except (aiohttp.ClientError, TimeoutError, OSError):
+        pass
+    detail = ", ".join(balances[:4]) if balances else "баланс 0"
+    if withdraw is not None:
+        detail += "; вывод: вкл" if withdraw else "; вывод: выкл"
+    return {"status": "valid", "balances": balances[:8], "withdraw_enabled": withdraw, "detail": detail}
+
+
+async def _verify_bybit(session: aiohttp.ClientSession, key: str, secret: str,
+                       proxy: str | None, timeout_s: float) -> dict[str, Any]:
+    ts = str(int(time.time() * 1000))
+    qs = "accountType=UNIFIED"
+    sign = _hmac_hex(secret, ts + key + "5000" + qs)
+    headers = {"X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts,
+               "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": sign}
+    async with session.get(
+        f"https://api.bybit.com/v5/account/wallet-balance?{qs}",
+        headers=headers, proxy=proxy, timeout=timeout_s,
+    ) as resp:
+        if resp.status != 200:
+            return _ex_error(resp.status)
+        data = await resp.json()
+        if data.get("retCode") != 0:
+            return {"status": "invalid", "detail": f"retCode {data.get('retCode')}",
+                    "balances": [], "withdraw_enabled": None}
+        coins = []
+        for acc in (data.get("result") or {}).get("list") or []:
+            for c in acc.get("coin") or []:
+                wb = float(c.get("walletBalance") or 0)
+                if wb > 0:
+                    coins.append(f"{c.get('coin')}={wb:.6g}")
+    # Права ключа: /v5/user/query-api (может отсутствовать у старых ключей)
+    ts2 = str(int(time.time() * 1000))
+    sign2 = _hmac_hex(secret, ts2 + key + "5000")
+    headers2 = {"X-BAPI-API-KEY": key, "X-BAPI-TIMESTAMP": ts2,
+                "X-BAPI-RECV-WINDOW": "5000", "X-BAPI-SIGN": sign2}
+    withdraw: bool | None = None
+    try:
+        async with session.get(
+            "https://api.bybit.com/v5/user/query-api",
+            headers=headers2, proxy=proxy, timeout=timeout_s,
+        ) as resp:
+            if resp.status == 200:
+                body = await resp.json(content_type=None)
+                perms = str((body.get("result") or {}).get("permissions") or body.get("result") or "")
+                if perms:
+                    compact = re.sub(r'[\s"]', "", perms)
+                    withdraw = "withdraw:true" in compact.lower()
+    except (aiohttp.ClientError, TimeoutError, OSError):
+        pass
+    detail = ", ".join(coins[:4]) if coins else "баланс 0"
+    if withdraw is not None:
+        detail += "; вывод: вкл" if withdraw else "; вывод: выкл"
+    return {"status": "valid", "balances": coins[:8], "withdraw_enabled": withdraw, "detail": detail}
+
+
+async def _verify_okx(session: aiohttp.ClientSession, key: str, secret: str,
+                      passphrase: str | None, proxy: str | None,
+                      timeout_s: float) -> dict[str, Any]:
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    path = "/api/v5/account/balance"
+    sign = _hmac_b64(secret.encode(), ts + "GET" + path)
+    headers = {"OK-ACCESS-KEY": key, "OK-ACCESS-SIGN": sign,
+               "OK-ACCESS-TIMESTAMP": ts, "OK-ACCESS-PASSPHRASE": passphrase or ""}
+    async with session.get(
+        "https://www.okx.com" + path,
+        headers=headers, proxy=proxy, timeout=timeout_s,
+    ) as resp:
+        if resp.status != 200:
+            return _ex_error(resp.status)
+        data = await resp.json()
+        if str(data.get("code")) != "0":
+            return {"status": "invalid", "detail": f"code {data.get('code')}",
+                    "balances": [], "withdraw_enabled": None}
+        coins = []
+        for d in data.get("data") or []:
+            for dt in d.get("details") or []:
+                bal = float(dt.get("bal") or 0)
+                if bal > 0:
+                    coins.append(f"{dt.get('ccy')}={bal:.6g}")
+    return {"status": "valid", "balances": coins[:8], "withdraw_enabled": None,
+            "detail": ", ".join(coins[:4]) if coins else "баланс 0"}
+
+
+async def _verify_kucoin(session: aiohttp.ClientSession, key: str, secret: str,
+                        passphrase: str | None, proxy: str | None,
+                        timeout_s: float) -> dict[str, Any]:
+    ts = str(int(time.time() * 1000))
+    path = "/api/v1/accounts"
+    try:
+        sec_bytes = base64.b64decode(secret.encode())
+    except (ValueError, TypeError):
+        sec_bytes = secret.encode()
+    sign = _hmac_b64(sec_bytes, ts + "GET" + path)
+    headers = {
+        "KC-API-KEY": key, "KC-API-SIGN": sign, "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": base64.b64encode((passphrase or "").encode()).decode(),
+        "KC-API-KEY-VERSION": "2",
+    }
+    async with session.get(
+        "https://api.kucoin.com" + path,
+        headers=headers, proxy=proxy, timeout=timeout_s,
+    ) as resp:
+        if resp.status != 200:
+            return _ex_error(resp.status)
+        data = await resp.json(content_type=None)
+        if str(data.get("code")) != "200000":
+            return {"status": "invalid", "detail": f"code {data.get('code')}",
+                    "balances": [], "withdraw_enabled": None}
+        coins = [
+            f"{a.get('currency')}={float(a.get('balance') or 0):.6g}"
+            for a in data.get("data") or [] if float(a.get("balance") or 0) > 0
+        ]
+    return {"status": "valid", "balances": coins[:8], "withdraw_enabled": None,
+            "detail": ", ".join(coins[:4]) if coins else "баланс 0"}
+
+
+async def verify_exchange_keypair(session: aiohttp.ClientSession, exchange: str,
+                                 key: str, secret: str, passphrase: str | None = None,
+                                 proxy: str | None = None,
+                                 timeout_s: float = 8.0) -> dict[str, Any]:
+    """Read-only проверка ключа биржи: HMAC-подпись, баланс + право вывода."""
+    result: dict[str, Any] = {"exchange": exchange, "key": key[:8] + "…",
+                              "status": "unknown", "detail": "",
+                              "balances": [], "withdraw_enabled": None}
+    try:
+        if exchange == "binance":
+            result.update(await _verify_binance(session, key, secret, proxy, timeout_s))
+        elif exchange == "bybit":
+            result.update(await _verify_bybit(session, key, secret, proxy, timeout_s))
+        elif exchange == "okx":
+            result.update(await _verify_okx(session, key, secret, passphrase, proxy, timeout_s))
+        elif exchange == "kucoin":
+            result.update(await _verify_kucoin(session, key, secret, passphrase, proxy, timeout_s))
+        else:
+            result["detail"] = f"unknown exchange {exchange}"
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         result["detail"] = type(exc).__name__
     return result

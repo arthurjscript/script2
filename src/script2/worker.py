@@ -141,6 +141,35 @@ class Worker:
                         chk.get("kind"),
                         chk.get("detail") or "",
                     )
+            for chk in result.data.get("twilio_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "TWILIO_PAIR_VALID id=%d ip=%s:%d sid=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("sid"),
+                        chk.get("detail") or "",
+                    )
+            for chk in result.data.get("twitter_checks") or []:
+                if chk.get("status") == "valid":
+                    log.info(
+                        "TWITTER_VALID id=%d ip=%s:%d",
+                        row.id,
+                        row.host,
+                        row.port,
+                    )
+            for chk in result.data.get("exchange_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "EXCHANGE_KEY_VALID id=%d ip=%s:%d exch=%s balances=%s withdraw=%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("exchange"),
+                        chk.get("detail") or "",
+                        chk.get("withdraw_enabled"),
+                    )
             for chk in result.data.get("aws_key_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(
