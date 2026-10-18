@@ -269,16 +269,18 @@ async def _verify_yandex_direct(
             f = c.get("Funds") or {}
             saf = f.get("SharedAccountFunds") or {}
             spend += saf.get("Spend", 0) or 0
-            rest += f.get("Rest", 0) or 0
+            rest += (f.get("Rest", 0) or 0) + (saf.get("Balance", 0) or 0)
             if c.get("Currency"):
                 cur = c["Currency"]
+        # общая сумма видна только в аккаунте-корпорации; по кампаниям — Rest
         tail = f"кампаний {len(camps)}"
         if spend:
             tail += f", расход {spend / 1e6:,.0f} {cur}".replace(",", " ")
         if rest:
             tail += f", остаток {rest / 1e6:,.0f} {cur}".replace(",", " ")
         result["status"] = "valid"
-        result["detail"] = tail
+        # identity в начале — нужен для извлечения прибыли (какой аккаунт)
+        result["detail"] = f"{identity} — {tail}"
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
         result["detail"] = type(exc).__name__
     return result
@@ -760,12 +762,18 @@ async def verify_secret(
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    amounts = [
-                        f"{b.get('amount', 0) / 100:.2f} {b.get('currency', '')}"
-                        for b in (data.get("available") or [])
-                    ]
+                    def _fmt(entries):
+                        return [
+                            f"{(b or {}).get('amount', 0) / 100:.2f} {(b or {}).get('currency', '')}"
+                            for b in (entries or [])
+                        ]
+                    avail = ", ".join(_fmt(data.get("available")) or ["0"])
+                    pend = ", ".join(_fmt(data.get("pending")))
                     result["status"] = "valid"
-                    result["detail"] = "balance: " + (", ".join(amounts) if amounts else "0")
+                    result["detail"] = "balance: " + avail
+                    if pend:
+                        # pending — деньги, которые упадут на баланс: тоже профит
+                        result["detail"] += f" (pending {pend})"
                 elif resp.status == 401:
                     result["status"] = "invalid"
                     result["detail"] = "HTTP 401"
