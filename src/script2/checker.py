@@ -653,6 +653,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             twilio_pairs_found: set[tuple[str, str]] = set()
             twitter_bearers_found: set[str] = set()
             twitter_sessions_found: list[dict[str, Any]] = []
+            twitter_sessions_total: int = 0
             exchange_pairs_found: list[dict[str, Any]] = []
             exchange_pairs_seen: set[tuple[str, str, str]] = set()
             cryptopay_keys_found: list[dict[str, Any]] = []
@@ -747,7 +748,15 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 if cfg.twitter_checks:
                                     twitter_bearers_found.update(
                                         extract_twitter_bearers(body[:100_000]))
-                                    for tses in extract_twitter_sessions(body[:100_000]):
+                                    all_sessions = extract_twitter_sessions(
+                                        body[:100_000], limit=None)
+                                    # размер хранилища аккаунтов на панели
+                                    twitter_sessions_total = max(
+                                        twitter_sessions_total, len(all_sessions))
+                                    for tses in all_sessions:
+                                        if len(twitter_sessions_found) >= \
+                                                cfg.twitter_session_max:
+                                            break
                                         if not any(t["auth_token"] == tses["auth_token"]
                                                    for t in twitter_sessions_found):
                                             twitter_sessions_found.append(tses)
@@ -1033,6 +1042,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "twilio_checks": twilio_checks,
                 "twitter_checks": twitter_checks,
                 "twitter_session_checks": twitter_session_checks,
+                "twitter_sessions_total": twitter_sessions_total,
                 "exchange_checks": exchange_checks,
                 "cryptopay_checks": cryptopay_checks,
             }

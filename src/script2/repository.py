@@ -48,11 +48,13 @@ INSERT INTO checked_hosts (
     source_id, attempt, host, port, scheme, status, content_type, content_length, server, check_id, created_at,
     is_alive, latency_ms, has_openapi, spec_path, spec_title,
     total_endpoints, vulnerable_count, protected_count, public_count,
-    data_patterns, severity, result, worker_id
+    data_patterns, severity, result, worker_id, panel_status
 )
 SELECT
     h.id, $2, h.host, h.port, h.scheme, h.status, h.content_type, h.content_length, h.server, h.check_id, h.created_at,
-    $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+    $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+    (SELECT prev.panel_status FROM checked_hosts prev
+     WHERE prev.source_id = h.id ORDER BY prev.attempt DESC LIMIT 1)
 FROM live_hosts AS h
 WHERE h.id = $1
 ON CONFLICT (source_id, attempt) DO NOTHING

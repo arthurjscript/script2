@@ -777,8 +777,11 @@ _TW_CT0_RE = re.compile(r'"ct0"\s*:\s*"([0-9a-fA-F]{32,160})"')
 _TW_USER_RE = re.compile(r'"(?:username|screen_name|handle)"\s*:\s*"([A-Za-z0-9_]{2,20})"')
 
 
-def extract_twitter_sessions(text: str, limit: int = 3) -> list[dict[str, Any]]:
-    """Пары auth_token+ct0 (полные hex-значения) + username из того же объекта."""
+def extract_twitter_sessions(text: str, limit: int | None = 3) -> list[dict[str, Any]]:
+    """Пары auth_token+ct0 (полные hex-значения) + username из того же объекта.
+
+    limit=None собирает все пары (для подсчёта размера аккаунт-хранилища).
+    """
     out: list[dict[str, Any]] = []
     for m in _TW_AT_RE.finditer(text):
         window = text[max(0, m.start() - 300): m.start() + 400]
@@ -790,7 +793,7 @@ def extract_twitter_sessions(text: str, limit: int = 3) -> list[dict[str, Any]]:
         um = _TW_USER_RE.search(window)
         out.append({"auth_token": m.group(1), "ct0": cm.group(1),
                     "username": um.group(1) if um else None})
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
             break
     return out
 
