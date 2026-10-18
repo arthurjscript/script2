@@ -327,6 +327,11 @@ PLACEHOLDER_VALUES = {    "password", "passwd", "secret", "token", "key", "api_k
     "redacted", "hidden", "removed",
 }
 
+# Явный мусор: /demo /guest (и варианты demo-credentials, guest-login, /demo/) —
+# демо-креды и guest-онбординг выдаются приложением по дизайну, это не утечки.
+# Разделители по краям отсекают случайные вхождения (например /demographics).
+DEMO_GUEST_PATH_RE = re.compile(r'(?:^|[/._-])(?:demo|guests?)(?:$|[/._-])', re.I)
+
 
 def is_placeholder_value(field: str, value: str) -> bool:
     """Проверяет что значение - placeholder (совпадает с именем поля или типичный пример)."""
@@ -727,6 +732,11 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     if time.monotonic() >= deadline:
                         break
                     if method.upper() not in ("GET", "POST", "PUT", "DELETE", "PATCH"):
+                        continue
+
+                    # Игнорируем демо/гостевые эндпоинты целиком:
+                    # там креды выданы специально, проверять и писать нечего
+                    if DEMO_GUEST_PATH_RE.search(path_template):
                         continue
 
                     # Проверяем security на уровне операции
