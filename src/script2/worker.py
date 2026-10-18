@@ -108,13 +108,14 @@ class Worker:
             for chk in result.data.get("telegram_checks") or []:
                 if chk.get("status") == "valid":
                     if chk.get("money"):
+                        money_bits = list(chk.get("money_commands") or []) + list(chk.get("money_text") or [])
                         log.warning(
-                            "TELEGRAM_BOT_MONEY id=%d ip=%s:%d bot=@%s commands=%s",
+                            "TELEGRAM_BOT_MONEY id=%d ip=%s:%d bot=@%s signals=%s",
                             row.id,
                             row.host,
                             row.port,
                             chk.get("username") or "?",
-                            ",".join(chk.get("money_commands") or []),
+                            " | ".join(money_bits)[:200],
                         )
                     else:
                         log.info(

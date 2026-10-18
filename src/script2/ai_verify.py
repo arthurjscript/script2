@@ -165,9 +165,11 @@ async def verify_telegram_bot(
                 result["status"] = "error"
                 result["detail"] = f"HTTP {resp.status}"
 
-        # Живой бот: ищем платёжные команды
+        # Живой бот: ищем платёжные команды и описания
         if result["status"] == "valid":
             try:
+                money_cmds: list[str] = []
+                money_desc: list[str] = []
                 async with session.get(
                     f"https://api.telegram.org/bot{token}/getMyCommands",
                     proxy=proxy,
@@ -176,14 +178,30 @@ async def verify_telegram_bot(
                     if resp.status == 200:
                         data = await resp.json()
                         cmds = data.get("result") or []
-                        money = [
+                        money_cmds = [
                             c.get("command", "")
                             for c in cmds
                             if MONEY_COMMAND_RE.search(str(c.get("command", "")))
                             or MONEY_COMMAND_RE.search(str(c.get("description", "")))
                         ]
-                        result["money_commands"] = money
-                        result["money"] = bool(money)
+                # Описания бота часто прямо говорят о деньгах (вывод/баланс)
+                for meth, field in (
+                    ("getMyDescription", "description"),
+                    ("getMyShortDescription", "short_description"),
+                ):
+                    async with session.get(
+                        f"https://api.telegram.org/bot{token}/{meth}",
+                        proxy=proxy,
+                        timeout=timeout,
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            text = str((data.get("result") or {}).get(field) or "")
+                            if text and MONEY_COMMAND_RE.search(text):
+                                money_desc.append(text[:100])
+                result["money_commands"] = money_cmds
+                result["money_text"] = money_desc
+                result["money"] = bool(money_cmds or money_desc)
             except (aiohttp.ClientError, TimeoutError):
                 pass
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
@@ -330,24 +348,60 @@ def extract_dsns(text: str) -> list[str]:
     return list(dict.fromkeys(DSN_RE.findall(text)))
 
 
-async def check_dsn(dsn: str, timeout_s: float = 5.0) -> dict[str, Any]:
+def _effective_dsn_host(host: str, target_host: str | None) -> tuple[str, bool]:
+    """Хост для подключения: внутренние (localhost/docker) подменяем на IP цели.
+
+    DSN вида postgres://user:pass@db:5432 виден изнутри контейнера цели -
+    снаружи этот же сервис обычно доступен на публичном IP самого хоста.
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return h, False
+    internal = (
+        h in ("localhost", "::1", "host.docker.internal")
+        or h.startswith("127.")
+        or "." not in h  # docker service name: db, postgres, redis...
+    )
+    if not internal:
+        try:
+            import ipaddress
+            ip = ipaddress.ip_address(h)
+            internal = ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            internal = False
+    if internal and target_host:
+        return target_host, True
+    return host, False
+
+
+async def check_dsn(
+    dsn: str, timeout_s: float = 5.0, target_host: str | None = None,
+) -> dict[str, Any]:
     """Проверяет DSN: доступен ли хост, работают ли креды (postgres).
 
+    Внутренние хосты (localhost/docker) переподключаются на публичный IP
+    цели target_host - там обычно выставлен тот же сервис.
     TCP-коннект идёт напрямую (asyncpg не умеет прокси) - это нормально:
     к найденной БД всё равно придётся подключаться для эксплуатации.
     """
-    result: dict[str, Any] = {"dsn": dsn, "status": "unreachable", "error": ""}
+    result: dict[str, Any] = {
+        "dsn": dsn, "status": "unreachable", "error": "",
+        "connect_host": "", "via": "",
+    }
     try:
         u = urlsplit(dsn)
         host = u.hostname or ""
+        connect_host, rewritten = _effective_dsn_host(host, target_host)
+        result["connect_host"] = connect_host
+        result["via"] = target_host if rewritten else ""
         port = u.port or DSN_DEFAULT_PORTS.get(u.scheme.lower(), 0)
-        if not host or not port:
+        if not connect_host or not port:
             result["error"] = "bad dsn"
             return result
 
         try:
             reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port), timeout=timeout_s
+                asyncio.open_connection(connect_host, port), timeout=timeout_s
             )
             writer.close()
             await writer.wait_closed()
@@ -357,7 +411,12 @@ async def check_dsn(dsn: str, timeout_s: float = 5.0) -> dict[str, Any]:
 
         # Полная проверка кредов - только postgres (asyncpg уже в зависимостях)
         if u.scheme.lower() in ("postgres", "postgresql") and u.username and u.password:
-            clean_dsn = dsn.split("?", 1)[0]
+            # Пересобираем DSN с эффективным хостом (без query)
+            auth = u.username
+            if u.password is not None:
+                auth += ":" + u.password
+            new_netloc = f"{auth}@{connect_host}" + (f":{u.port}" if u.port else "")
+            clean_dsn = urlunsplit((u.scheme, new_netloc, u.path or "/", "", ""))
             for ssl_arg in (None, False):
                 try:
                     import asyncpg

@@ -187,20 +187,40 @@ def is_placeholder_value(field: str, value: str) -> bool:
 
 
 def is_aws_example_key(key: str) -> bool:
-    """Проверяет что AWS ключ - пример из документации."""
-    return key in AWS_EXAMPLE_KEYS or "EXAMPLE" in key.upper()
+    """Проверяет что AWS ключ - пример из документации или мусор (блобы/заполнители)."""
+    if key in AWS_EXAMPLE_KEYS or "EXAMPLE" in key.upper():
+        return True
+    # Низкая энтропия: AKIAAAAUAAAAAAAAAAAA (base64-блобы, заполнители)
+    return len(set(key[4:])) < 4
 
 
 def is_placeholder_dsn(dsn: str) -> bool:
-    """Проверяет что DSN - placeholder/пример."""
+    """Проверяет что DSN - placeholder/пример/шаблон/маска."""
     lower = dsn.lower()
     # user:pass@host - явный пример
     if "user:pass@" in lower or "username:password@" in lower:
         return True
+    # Шаблонные значения конфигураций {{config...}}
+    if "{{" in dsn or "}}" in dsn:
+        return True
+    # Замаскированный пароль (**** / ...)
+    if "://" in dsn:
+        creds = dsn.split("://", 1)[1].split("@", 1)[0]
+        if ":" in creds:
+            pw = creds.rsplit(":", 1)[1]
+            if pw and set(pw) <= {"*", ".", "-"}:
+                return True
     # Проверяем хост после @
     if "@" in lower:
         host_part = lower.split("@")[1].split("/")[0].split(":")[0]
         if host_part in PLACEHOLDER_HOSTS:
+            # localhost с реальными кредами - не placeholder:
+            # это креды БД самой цели, проверим на её публичном IP
+            if host_part in ("localhost", "127.0.0.1") and "://" in dsn:
+                creds = dsn.split("://", 1)[1].split("@", 1)[0]
+                user, _, pw = creds.partition(":")
+                if user and pw and pw.lower() not in PLACEHOLDER_VALUES and not is_masked_value(pw):
+                    return False
             return True
     return False
 
@@ -363,9 +383,14 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     if user.lower() in PLACEHOLDER_VALUES or pwd.lower() in PLACEHOLDER_VALUES or is_masked_value(pwd):
                         continue
 
-            # Для AWS ключей проверяем что не пример
+            # Для AWS ключей: не пример, не мусор, не presigned URL
             if name == "aws_access_key":
                 if is_aws_example_key(value_text):
+                    continue
+                # presigned S3 URL: ключ врЕменный, зашит в самой ссылке -
+                # это не утечка кредов
+                before = body[max(0, m.start() - 30):m.start()]
+                if "X-Amz-Credential=" in before or "AWSAccessKeyId=" in before:
                     continue
 
             # Для DSN проверяем что не placeholder
@@ -619,11 +644,15 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if severity_order.get(max_severity, 0) < 2:
                             max_severity = "HIGH"
 
-            # Проверка DSN: доступен ли хост, работают ли креды (postgres)
+            # Проверка DSN: доступен ли хост, работают ли креды (postgres).
+            # Внутренние хосты (localhost/docker) проверяем на публичном IP цели.
             dsn_checks: list[dict[str, Any]] = []
             if cfg.dsn_checks and dsns_found:
                 for d in list(dsns_found)[: cfg.dsn_max]:
-                    chk = await check_dsn(d, timeout_s=max(cfg.check_timeout, 5))
+                    chk = await check_dsn(
+                        d, timeout_s=max(cfg.check_timeout, 5),
+                        target_host=row.host,
+                    )
                     dsn_checks.append(chk)
                     if chk["status"] == "auth_ok":
                         # Креды работают - полный доступ к БД
