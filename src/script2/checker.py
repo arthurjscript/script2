@@ -350,6 +350,9 @@ def is_placeholder_value(field: str, value: str) -> bool:
     # Типичные placeholder значения
     if val_lower in PLACEHOLDER_VALUES:
         return True
+    # Подстановки окружения: ${VAR}, $VAR, {{VAR}} — значение лежит в конфиге
+    if INTERPOLATED_RE.match(val_lower):
+        return True
     return False
 
 
@@ -424,6 +427,9 @@ ENCODED_BLOB_RE = re.compile(r'^[A-Za-z0-9+/=_-]{100,}$')
 DATE_VALUE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 # UUID (анонимные сессии/аналитика выдают UUID в session_id — это не утечка)
 UUID_VALUE_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.I)
+# Подстановки окружения: "${REDIS_PASSWORD}", "$DB_PASS", "{{secret_key}}" —
+# в ответе лежит шаблон, а не значение
+INTERPOLATED_RE = re.compile(r'^(?:\$\{[^}]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,127}|\{\{[^}]{1,128}\}\})$')
 
 
 def is_junk_token_value(val: str) -> bool:
