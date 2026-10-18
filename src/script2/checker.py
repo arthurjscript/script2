@@ -811,20 +811,28 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     if severity_order.get("HIGH", 0) > severity_order.get(sev, 0):
                                         sev = "HIGH"
 
-                                # is_admin: не просто показываем - ищем фактический вход
+                                # is_admin: голый флаг в списках профилей - не находка.
+                                # Находим факт входа: /admin/* без auth или токен рядом.
                                 if "admin_flag" in patterns:
-                                    # путь /admin/* отвечает 200 без кредов -
-                                    # админ-зона доступна, вход есть
                                     if ADMIN_PATH_RE.search(path_template) and "admin_area" not in patterns:
                                         patterns.append("admin_area")
                                         if severity_order["CRITICAL"] > severity_order.get(sev, 0):
                                             sev = "CRITICAL"
-                                    elif ADMIN_TOKEN_RE.search(body[:2_000]):
-                                        # is_admin + токен в одном ответе - вход выдан
-                                        if "admin_access" not in patterns:
-                                            patterns.append("admin_access")
+                                    elif ADMIN_TOKEN_RE.search(body[:2_000]) and "admin_access" not in patterns:
+                                        patterns.append("admin_access")
                                         if severity_order["CRITICAL"] > severity_order.get(sev, 0):
                                             sev = "CRITICAL"
+                                    else:
+                                        # просто is_admin: true/1 в данных - убираем;
+                                        # severity пересчитываем по оставшимся паттернам
+                                        patterns.remove("admin_flag")
+                                        if patterns:
+                                            sev = max(
+                                                (SEVERITY_MAP.get(p, "LOW") for p in patterns),
+                                                key=severity_order.get,
+                                            )
+                                        else:
+                                            sev = "LOW"
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
