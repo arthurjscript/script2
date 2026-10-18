@@ -118,8 +118,7 @@ def _models_summary(data: Any) -> str:
                 names.append(str(mid).removeprefix("models/"))
     if not names:
         return ""
-    sample = ", ".join(names[:3])
-    return f"{len(names)} моделей: {sample}" + ("…" if len(names) > 3 else "")
+    return f"{len(names)} моделей: {', '.join(names)}"
 
 
 async def _deepseek_balance(
