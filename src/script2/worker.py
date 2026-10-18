@@ -104,11 +104,12 @@ class Worker:
             for chk in result.data.get("ai_key_checks") or []:
                 if chk.get("status") == "valid":
                     log.info(
-                        "AI_KEY_VALID id=%d ip=%s:%d provider=%s %s",
+                        "AI_KEY_VALID id=%d ip=%s:%d provider=%s uncensored=%s %s",
                         row.id,
                         row.host,
                         row.port,
                         chk.get("provider"),
+                        chk.get("uncensored", False),
                         chk.get("detail") or "",
                     )
             for chk in result.data.get("telegram_checks") or []:
@@ -170,6 +171,13 @@ class Worker:
                         chk.get("detail") or "",
                         chk.get("withdraw_enabled"),
                     )
+            if "money_target" in (result.data_patterns or []):
+                log.warning(
+                    "MONEY_TARGET id=%d ip=%s:%d withdraw endpoints + verified money keys",
+                    row.id,
+                    row.host,
+                    row.port,
+                )
             for chk in result.data.get("aws_key_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

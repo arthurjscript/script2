@@ -140,7 +140,7 @@ SENSITIVE_PATTERNS = {
     # Generic часть требует цифру в значении (отсеиваем placeholder'ы вида "your_api_key")
     # и исключает ровно 64 alnum (их ловит binance_key) - дублей нет.
     "ai_apikey": re.compile(
-        r'(?:\b(?:sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
+        r'(?:\b(?:sk-|sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
         r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"'
         r'(?![A-Za-z0-9]{64}")'  # ровно 64 alnum ловит binance_key
         r'(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")'  # UUID - это id, не ключ
@@ -353,6 +353,7 @@ SEVERITY_MAP = {
     "twitter_token_valid": "MEDIUM",
     "exchange_key_valid": "CRITICAL",
     "exchange_withdraw_enabled": "CRITICAL",
+    "money_target": "CRITICAL",
     "dsn_reachable": "MEDIUM",
     "dsn_auth_ok": "CRITICAL",
     "slack_token": "HIGH",
@@ -846,6 +847,23 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             max_severity = SEVERITY_MAP["exchange_key_valid"]
                         if chk.get("withdraw_enabled") is True:
                             all_patterns.append("exchange_withdraw_enabled")
+
+            # Money-корреляция: withdraw-эндпоинты + проверенные денежные
+            # ключи на одном хосте = самая ценная цель (деньги и вход в одном месте)
+            money_verified = (
+                any(c.get("status") == "valid" for c in exchange_checks)
+                or any(c.get("status") == "valid" and c.get("money") for c in telegram_checks)
+                or any(c.get("status") == "valid" and c.get("kind") == "stripe" for c in secret_checks)
+                or any(c.get("status") == "auth_ok" for c in dsn_checks)
+            )
+            if money_verified and any(
+                "withdraw_endpoint" in (ep.get("patterns") or [])
+                and "withdraw_noise" not in (ep.get("patterns") or [])
+                for ep in endpoints_data
+            ):
+                all_patterns.append("money_target")
+                if severity_order.get(max_severity, 0) < 3:
+                    max_severity = "CRITICAL"
 
             result.endpoints = endpoints_data
             result.data_patterns = list(set(all_patterns))

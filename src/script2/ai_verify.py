@@ -25,7 +25,15 @@ KEY_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     ("gemini", re.compile(r'\bAIza[0-9A-Za-z_-]{35}')),
     ("huggingface", re.compile(r'\bhf_[A-Za-z0-9]{30,}')),
     ("xai", re.compile(r'\bxai-[A-Za-z0-9]{40,}')),
+    # deepseek: sk- + ровно 32 hex (у openai 48+ alnum, коллизий нет)
+    ("deepseek", re.compile(r'\bsk-[0-9a-f]{32}\b')),
+    # fireworks.ai: есть некенсурированные модели (dolphin и др.)
+    ("fireworks", re.compile(r'\bfw_[A-Za-z0-9]{20,40}\b')),
 ]
+
+# Провайдеры, у которых есть модели без цензуры (dolphin/hermes/llama-uncensored
+# и т.п.) — такие ключи ценнее обычных
+UNCENSORED_PROVIDERS = {"openrouter", "xai", "together", "fireworks", "deepseek"}
 
 # Бесплатные проверочные эндпоинты (не генерируют токены)
 PROVIDER_URLS = {
@@ -36,6 +44,10 @@ PROVIDER_URLS = {
     "openrouter": "https://openrouter.ai/api/v1/auth/key",
     "huggingface": "https://huggingface.co/api/whoami-v2",
     "xai": "https://api.x.ai/v1/api-key",
+    "deepseek": "https://api.deepseek.com/models",
+    "fireworks": "https://api.fireworks.ai/inference/v1/models",
+    # together.ai: ключ = 64 hex, формат неуникальный — извлекаем по контексту
+    "together": "https://api.together.xyz/v1/models",
 }
 
 
@@ -49,6 +61,14 @@ def extract_ai_keys(text: str) -> list[tuple[str, str]]:
             if key not in seen:
                 seen.add(key)
                 found.append((provider, key))
+    # together.ai: 64-hex ключ, узнаём только по слову together рядом
+    for m in re.finditer(r'(?i)together', text):
+        window = text[max(0, m.start() - 200): m.start() + 400]
+        km = re.search(r'\b([0-9a-f]{64})\b', window)
+        if km and km.group(1) not in seen:
+            seen.add(km.group(1))
+            found.append(("together", km.group(1)))
+            break
     return found
 
 
@@ -65,6 +85,7 @@ async def verify_ai_key(
         "key": key,
         "status": "error",
         "detail": "",
+        "uncensored": provider in UNCENSORED_PROVIDERS,
     }
     try:
         if provider == "gemini":
