@@ -24,7 +24,7 @@ class Settings(BaseSettings):
 
     # Таймауты
     check_timeout: int = 2
-    host_timeout: int = 90  # бюджет на сканирование всего хоста (все запросы)
+    host_timeout: int = 600  # бюджет на сканирование всего хоста (все запросы, вкл. id-fuzz)
     lease_seconds: int = 300
     shutdown_timeout: int = 30
 
