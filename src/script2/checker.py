@@ -754,7 +754,13 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # github, gitlab, mailgun, sendgrid, npm, dropbox (read-only)
             secret_checks: list[dict[str, Any]] = []
             if cfg.secret_checks and secrets_found:
-                for kind, val in list(secrets_found)[: cfg.secret_max]:
+                kind_checked: dict[str, int] = {}
+                for kind, val in sorted(secrets_found)[: cfg.secret_max]:
+                    # Discord банирует по rate-limit: проверяем максимум N токенов
+                    # с одного хоста, остальные остаются как находки без проверки
+                    if kind == "discord" and kind_checked.get("discord", 0) >= cfg.discord_verify_max:
+                        continue
+                    kind_checked[kind] = kind_checked.get(kind, 0) + 1
                     chk = await verify_secret(
                         session, kind, val,
                         proxy=proxy, timeout_s=max(cfg.check_timeout, 5),

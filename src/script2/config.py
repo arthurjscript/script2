@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     # Service secret verification (stripe/slack/discord/github/..., read-only)
     secret_checks: bool = True
     secret_max: int = 10
+    # Discord: max tokens per host, чтобы не ловить rate-limit от API
+    discord_verify_max: int = 5
 
     # Proxy
     proxy_file: str = ""
