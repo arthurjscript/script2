@@ -331,6 +331,9 @@ PLACEHOLDER_VALUES = {    "password", "passwd", "secret", "token", "key", "api_k
 # демо-креды и guest-онбординг выдаются приложением по дизайну, это не утечки.
 # Разделители по краям отсекают случайные вхождения (например /demographics).
 DEMO_GUEST_PATH_RE = re.compile(r'(?:^|[/._-])(?:demo|guests?)(?:$|[/._-])', re.I)
+# is_admin в ответе: путь /admin/* = админ-зона; токен рядом = выдан вход
+ADMIN_PATH_RE = re.compile(r'admin', re.I)
+ADMIN_TOKEN_RE = re.compile(r'"(?:access_?token|auth_?token|token)"\s*:\s*"[^"]{8,}"', re.I)
 
 
 def is_placeholder_value(field: str, value: str) -> bool:
@@ -502,6 +505,9 @@ SEVERITY_MAP = {
     "reset_token": "HIGH",
     "two_fa_backup": "CRITICAL",
     "admin_flag": "HIGH",
+    # is_admin в ответе + фактический вход (путь /admin/* или токен рядом)
+    "admin_area": "CRITICAL",
+    "admin_access": "CRITICAL",
     "keystore_json": "CRITICAL",
     "smtp_password": "HIGH",
     "database_url": "HIGH",
@@ -794,6 +800,21 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     patterns.append("wallet_address_money")
                                     if severity_order.get("HIGH", 0) > severity_order.get(sev, 0):
                                         sev = "HIGH"
+
+                                # is_admin: не просто показываем - ищем фактический вход
+                                if "admin_flag" in patterns:
+                                    # путь /admin/* отвечает 200 без кредов -
+                                    # админ-зона доступна, вход есть
+                                    if ADMIN_PATH_RE.search(path_template) and "admin_area" not in patterns:
+                                        patterns.append("admin_area")
+                                        if severity_order["CRITICAL"] > severity_order.get(sev, 0):
+                                            sev = "CRITICAL"
+                                    elif ADMIN_TOKEN_RE.search(body[:2_000]):
+                                        # is_admin + токен в одном ответе - вход выдан
+                                        if "admin_access" not in patterns:
+                                            patterns.append("admin_access")
+                                        if severity_order["CRITICAL"] > severity_order.get(sev, 0):
+                                            sev = "CRITICAL"
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
