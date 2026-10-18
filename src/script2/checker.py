@@ -851,12 +851,21 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
 
                                 # Сохраняем ответ только для важных эндпоинтов.
                                 # JSON парсим целиком: срез body[:50_000] ломал
-                                # валидный JSON посередине (обрезанный ответ в панели)
+                                # валидный JSON посередине (обрезанный ответ в панели).
+                                # JSONL (объект на строку) целиком тоже не парсится —
+                                # храним его как есть, без обрезки.
                                 if patterns:
                                     try:
                                         ep_data["response"] = json.loads(body)
                                     except (json.JSONDecodeError, ValueError):
-                                        ep_data["response"] = body[:50_000]
+                                        try:
+                                            for line in body.splitlines():
+                                                line = line.strip()
+                                                if line:
+                                                    json.loads(line)
+                                            ep_data["response"] = body
+                                        except (json.JSONDecodeError, ValueError):
+                                            ep_data["response"] = body[:50_000]
 
                             elif resp.status in (401, 403):
                                 ep_data["verdict"] = "PROTECTED"
