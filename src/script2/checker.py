@@ -41,6 +41,39 @@ from .models import HostRow, CheckResult
 # Money rule: пути вывода средств (только POST — GET-история не считается)
 WITHDRAW_PATH_RE = re.compile(r'(?:withdraw|withdrawal|payout|cash_?out)', re.I)
 
+# Money rule: адрес кошелька ценен только в денежном контексте.
+# Гейт: эндпоинт с профильным названием ИЛИ в том же ответе есть
+# ключи/платёжные секреты → wallet_address_money (HIGH).
+WALLET_MONEY_PATH_RE = re.compile(
+    r'(?:wallet|payout|withdraw|cash_?out|balance|treasury|billing|deposit|funds)',
+    re.I,
+)
+WALLET_MONEY_CO_PATTERNS = {
+    # ключевой материал
+    "private_key_pem", "evm_private_key", "bitcoin_wif", "solana_key",
+    "solana_keypair", "seed_phrase", "extended_key", "keystore_json",
+    "private_key_generic",
+    # платёжные API
+    "cryptopay_key", "exchange_keypair",
+}
+
+
+def gate_wallet_money(patterns: list[str], path: str) -> bool:
+    """True, если адрес кошелька найден в денежном контексте.
+
+    Сам по себе адрес — публичная информация (MEDIUM): большинство
+    находок — payout-адреса пользователей. HIGH даём, когда эндпоинт
+    называется по-денежному (wallet/balance/payout/...) или в том же
+    ответе есть ключи/платёжные секреты.
+    """
+    if "wallet_address" not in patterns:
+        return False
+    return bool(
+        WALLET_MONEY_PATH_RE.search(path)
+        or WALLET_MONEY_CO_PATTERNS.intersection(patterns)
+    )
+
+
 # Пассивная классификация withdraw-эндпоинта по уже записанному ответу
 # (без повторных опасных запросов)
 WITHDRAW_AUTH_RE = re.compile(
@@ -472,6 +505,7 @@ SEVERITY_MAP = {
     "db_password": "CRITICAL",
     # Адрес кошелька сам по себе денег не даёт (нужен ключ) - понижаем
     "wallet_address": "MEDIUM",
+    "wallet_address_money": "HIGH",
     "private_key_generic": "CRITICAL",
 }
 
@@ -720,6 +754,11 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     wsev = WITHDRAW_CLASS_SEVERITY.get(wclass, "CRITICAL")
                                     if severity_order.get(wsev, 0) > severity_order.get(sev, 0):
                                         sev = wsev
+                                # Money rule: адрес кошелька в денежном контексте
+                                if gate_wallet_money(patterns, path_template):
+                                    patterns.append("wallet_address_money")
+                                    if severity_order.get("HIGH", 0) > severity_order.get(sev, 0):
+                                        sev = "HIGH"
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
