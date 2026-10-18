@@ -85,6 +85,13 @@ WITHDRAW_VALIDATION_RE = re.compile(
     r'(is required|are required|must be provided|validation|expecting value|invalid request)',
     re.I,
 )
+# Валидация заголовков (deviceid/deviceType и т.п.): запрос не дошёл
+# до auth-слоя, открытость эндпоинта не подтверждена (DarvionPay-кейс)
+WITHDRAW_HEADERS_RE = re.compile(
+    r'(missingheaders|missing headers|deviceid|devicetype'
+    r'|must include [^"]{0,40}headers)',
+    re.I,
+)
 WITHDRAW_NOISE_RE = re.compile(
     r'(<!doctype|<html|application is running|website is not available'
     r'|ошибка 404|not found)',
@@ -95,6 +102,7 @@ WITHDRAW_CLASS_SEVERITY = {
     "withdraw_open": "CRITICAL",       # дошли до бизнес-валидации без auth
     "withdraw_processed": "CRITICAL", # запрос обработан успешно
     "withdraw_protected": "HIGH",     # auth реально требуется
+    "withdraw_headers": "HIGH",        # не дошли до auth - нужны заголовки
     "withdraw_noise": "MEDIUM",       # HTML-заглушка/мусор вместо API
 }
 
@@ -109,6 +117,8 @@ def classify_withdraw_response(body: str) -> str:
         return "withdraw_protected"
     if WITHDRAW_NOISE_RE.search(b):
         return "withdraw_noise"
+    if WITHDRAW_HEADERS_RE.search(b):
+        return "withdraw_headers"
     if WITHDRAW_VALIDATION_RE.search(b):
         return "withdraw_open"
     if re.search(r'"success"\s*:\s*true|"status"\s*:\s*"?(ok|success)', b, re.I) \
@@ -426,6 +436,7 @@ SEVERITY_MAP = {
     "withdraw_open": "CRITICAL",
     "withdraw_processed": "CRITICAL",
     "withdraw_protected": "HIGH",
+    "withdraw_headers": "HIGH",
     "withdraw_noise": "MEDIUM",
     # HIGH - доступ к системам
     "facebook_access_token": "HIGH",
