@@ -83,6 +83,12 @@ class Settings(BaseSettings):
     wp_checks: bool = True
     wp_verify_max: int = 10
 
+    # id-fuzz: id'шники из тел подставляются в GET-шаблоны с {param}
+    # (второй проход по тем же детекторам/экстракторам)
+    id_fuzz: bool = True
+    id_fuzz_max: int = 10  # id на шаблон
+    id_fuzz_templates_max: int = 5  # сколько разных GET-шаблонов фаззить
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""
