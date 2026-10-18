@@ -84,10 +84,13 @@ class Settings(BaseSettings):
     wp_verify_max: int = 10
 
     # id-fuzz: id'шники из тел подставляются в GET-шаблоны с {param}
-    # (второй проход по тем же детекторам/экстракторам)
+    # (второй проход по тем же детекторам/экстракторам). Лимит на
+    # идентичный GET-эндпоинт поднят: 50 id на шаблон, 10 шаблонов,
+    # до 5 раундов каскада (новые id из ответов -> следующий раунд)
     id_fuzz: bool = True
-    id_fuzz_max: int = 10  # id на шаблон
-    id_fuzz_templates_max: int = 5  # сколько разных GET-шаблонов фаззить
+    id_fuzz_max: int = 50
+    id_fuzz_templates_max: int = 10
+    id_fuzz_rounds: int = 5
 
     # Proxy
     proxy_file: str = ""
