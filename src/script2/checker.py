@@ -29,6 +29,48 @@ from .models import HostRow, CheckResult
 # Money rule: пути вывода средств (только POST — GET-история не считается)
 WITHDRAW_PATH_RE = re.compile(r'(?:withdraw|withdrawal|payout|cash_?out)', re.I)
 
+# Пассивная классификация withdraw-эндпоинта по уже записанному ответу
+# (без повторных опасных запросов)
+WITHDRAW_AUTH_RE = re.compile(
+    r'(authentication required|missing session|unauthorized|permission denied'
+    r'|认证失败|인증|please login|token required)',
+    re.I,
+)
+WITHDRAW_VALIDATION_RE = re.compile(
+    r'(is required|are required|must be provided|validation|expecting value|invalid request)',
+    re.I,
+)
+WITHDRAW_NOISE_RE = re.compile(
+    r'(<!doctype|<html|application is running|website is not available'
+    r'|ошибка 404|not found)',
+    re.I,
+)
+WITHDRAW_CLASS_SEVERITY = {
+    "": "CRITICAL",
+    "withdraw_open": "CRITICAL",       # дошли до бизнес-валидации без auth
+    "withdraw_processed": "CRITICAL", # запрос обработан успешно
+    "withdraw_protected": "HIGH",     # auth реально требуется
+    "withdraw_noise": "MEDIUM",       # HTML-заглушка/мусор вместо API
+}
+
+
+def classify_withdraw_response(body: str) -> str:
+    """Классификация withdraw-эндпоинта по уже полученному ответу.
+
+    Пассивно - повторные POST на вывод опасны, используем записанный ответ.
+    """
+    b = body[:5000]
+    if WITHDRAW_AUTH_RE.search(b):
+        return "withdraw_protected"
+    if WITHDRAW_NOISE_RE.search(b):
+        return "withdraw_noise"
+    if WITHDRAW_VALIDATION_RE.search(b):
+        return "withdraw_open"
+    if re.search(r'"success"\s*:\s*true|"status"\s*:\s*"?(ok|success)', b, re.I) \
+            or b.strip().lower() in ("success", "ok"):
+        return "withdraw_processed"
+    return ""
+
 OPENAPI_PATHS = [
     "/openapi.json",
     "/swagger.json",
@@ -264,6 +306,10 @@ SEVERITY_MAP = {
     "stripe_restricted": "CRITICAL",
     "withdraw_flag": "CRITICAL",
     "withdraw_endpoint": "CRITICAL",
+    "withdraw_open": "CRITICAL",
+    "withdraw_processed": "CRITICAL",
+    "withdraw_protected": "HIGH",
+    "withdraw_noise": "MEDIUM",
     # HIGH - доступ к системам
     "facebook_access_token": "HIGH",
     "github_token": "HIGH",
@@ -533,8 +579,16 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 # Классифицируем ответ
                                 patterns, sev = classify_response(body[:100_000])
                                 if withdraw_op:
+                                    # Пассивная классификация по ответу:
+                                    # open/processed = деньги доступны, protected =
+                                    # нужен auth, noise = заглушка
+                                    wclass = classify_withdraw_response(body)
                                     patterns = patterns + ["withdraw_endpoint"]
-                                    sev = "CRITICAL"
+                                    if wclass:
+                                        patterns.append(wclass)
+                                    wsev = WITHDRAW_CLASS_SEVERITY.get(wclass, "CRITICAL")
+                                    if severity_order.get(wsev, 0) > severity_order.get(sev, 0):
+                                        sev = wsev
                                 ep_data["patterns"] = patterns
                                 all_patterns.extend(patterns)
 
@@ -683,9 +737,11 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             ]
 
             # Money rule: хосты с withdraw-эндпоинтами выделяем явно
+            # (HTML-заглушки не считаем - эндпоинта фактически нет)
             withdraw_eps = [
                 ep for ep in vulnerable_eps
                 if "withdraw_endpoint" in ep["patterns"]
+                and "withdraw_noise" not in ep["patterns"]
             ]
 
             result.data = {

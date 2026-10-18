@@ -78,12 +78,18 @@ class Worker:
         if result.is_alive:
             self.done_alive += 1
             if result.data.get("withdraw_capable"):
+                classes: dict[str, int] = {}
+                for ep in result.data.get("vulnerable") or []:
+                    for p in ep.get("patterns") or []:
+                        if p.startswith("withdraw_"):
+                            classes[p] = classes.get(p, 0) + 1
                 log.warning(
-                    "WITHDRAW_CAPABLE id=%d ip=%s:%d severity=%s",
+                    "WITHDRAW_CAPABLE id=%d ip=%s:%d severity=%s classes=%s",
                     row.id,
                     row.host,
                     row.port,
                     result.severity,
+                    classes,
                 )
             if result.vulnerable_count > 0:
                 log.info(
