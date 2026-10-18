@@ -218,7 +218,11 @@ SENSITIVE_PATTERNS = {
     # Generic часть требует цифру в значении (отсеиваем placeholder'ы вида "your_api_key")
     # и исключает ровно 64 alnum (их ловит binance_key) - дублей нет.
     "ai_apikey": re.compile(
-        r'(?:\b(?:sk-|sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
+        # специфичные префиксы + bare sk- (только с заглавной внутри: URL-слаги
+        # вида sk-dau-mui-han... шумят) + deepseek 32hex
+        r'(?:\b(?:sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
+        r'|\bsk-[0-9a-f]{32}\b'
+        r'|\bsk-(?=[A-Za-z0-9_-]{20,})(?=[A-Za-z0-9_-]*(?-i:[A-Z]))[A-Za-z0-9_-]{20,}'
         r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"'
         r'(?![A-Za-z0-9]{64}")'  # ровно 64 alnum ловит binance_key
         r'(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")'  # UUID - это id, не ключ
@@ -890,7 +894,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 # JSON парсим целиком: срез body[:50_000] ломал
                                 # валидный JSON посередине (обрезанный ответ в панели).
                                 # JSONL (объект на строку) целиком тоже не парсится —
-                                # храним его как есть, без обрезки.
+                                # храним как есть, без обрезки. Не-JSON (html/xml) —
+                                # 100К, вровень с окном детекции body[:100_000]
                                 if patterns:
                                     try:
                                         ep_data["response"] = json.loads(body)
@@ -902,7 +907,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                                     json.loads(line)
                                             ep_data["response"] = body
                                         except (json.JSONDecodeError, ValueError):
-                                            ep_data["response"] = body[:50_000]
+                                            ep_data["response"] = body[:100_000]
 
                             elif resp.status in (401, 403):
                                 ep_data["verdict"] = "PROTECTED"
