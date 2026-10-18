@@ -223,6 +223,7 @@ SENSITIVE_PATTERNS = {
         r'(?:\b(?:sk-(?:proj|svcacct)-|sk-ant-|sk-or-v1-|gsk_|pplx-|hf_|xai-|r8_|fw_)[A-Za-z0-9_-]{20,}'
         r'|\bsk-[0-9a-f]{32}\b'
         r'|\bsk-(?=[A-Za-z0-9_-]{20,})(?=[A-Za-z0-9_-]*(?-i:[A-Z]))[A-Za-z0-9_-]{20,}'
+        r'|\by0_[A-Za-z0-9_-]{20,}'  # Yandex OAuth (Директ/Метрика)
         r'|"(?:api_key|apiKey|api_token|consumer_key|client_secret)"\s*:\s*"'
         r'(?![A-Za-z0-9]{64}")'  # ровно 64 alnum ловит binance_key
         r'(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")'  # UUID - это id, не ключ
