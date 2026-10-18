@@ -688,7 +688,7 @@ async def verify_secret(
                     data = await resp.json()
                     amounts = [
                         f"{b.get('amount', 0) / 100:.2f} {b.get('currency', '')}"
-                        for b in (data.get("available") or [])[:3]
+                        for b in (data.get("available") or [])
                     ]
                     result["status"] = "valid"
                     result["detail"] = "balance: " + (", ".join(amounts) if amounts else "0")
@@ -849,7 +849,7 @@ async def verify_twilio_pair(session: aiohttp.ClientSession, sid: str,
                              token: str, proxy: str | None = None,
                              timeout_s: float = 5.0) -> dict[str, Any]:
     """Twilio REST API = HTTP Basic sid:token, GET Accounts.json (read-only)."""
-    result: dict[str, Any] = {"sid": sid[:10] + "…", "status": "unknown", "detail": ""}
+    result: dict[str, Any] = {"sid": sid, "status": "unknown", "detail": ""}
     try:
         async with session.get(
             "https://api.twilio.com/2010-04-01/Accounts.json?PageSize=1",
@@ -1231,7 +1231,7 @@ async def verify_exchange_keypair(session: aiohttp.ClientSession, exchange: str,
                                  proxy: str | None = None,
                                  timeout_s: float = 8.0) -> dict[str, Any]:
     """Read-only проверка ключа биржи: HMAC-подпись, баланс + право вывода."""
-    result: dict[str, Any] = {"exchange": exchange, "key": key[:8] + "…",
+    result: dict[str, Any] = {"exchange": exchange, "key": key,
                               "status": "unknown", "detail": "",
                               "balances": [], "withdraw_enabled": None}
     try:
@@ -1309,7 +1309,7 @@ async def verify_cryptopay_key(session: aiohttp.ClientSession, service: str,
                                proxy: str | None = None,
                                timeout_s: float = 8.0) -> dict[str, Any]:
     """Read-only проверка ключа крипто-платёжки + баланс (выплаты возможны)."""
-    result: dict[str, Any] = {"service": service, "key": key[:10] + "…",
+    result: dict[str, Any] = {"service": service, "key": key,
                               "status": "unknown", "detail": "", "balances": []}
     try:
         if service in ("heleket", "cryptomus"):
