@@ -67,6 +67,9 @@ class Settings(BaseSettings):
     twitter_checks: bool = True
     twitter_max: int = 2
 
+    # Twitter/X сессии аккаунтов (cookies auth_token+ct0 из чекер-панелей)
+    twitter_session_max: int = 3
+
     # Exchange API keypairs: binance/bybit/okx/kucoin (HMAC, баланс+вывод)
     exchange_checks: bool = True
     exchange_max: int = 3

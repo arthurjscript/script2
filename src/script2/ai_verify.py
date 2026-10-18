@@ -7,6 +7,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import json
 import re
 import time
 from datetime import datetime, timezone
@@ -731,6 +732,126 @@ async def verify_twitter_bearer(session: aiohttp.ClientSession, token: str,
             elif resp.status in (400, 401, 403):
                 result["status"] = "invalid"
                 result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Twitter/X: сессия аккаунта (cookies auth_token + ct0) - полный доступ к
+# аккаунту, чекер-панели хранят их пачками вместе с username/email/password.
+# Проверка read-only: GraphQL UserByScreenName (мёртвая сессия -> 401).
+# ---------------------------------------------------------------------------
+TW_WEB_BEARER = (
+    "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D"
+    "1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+)
+TW_USER_BY_SN_URL = "https://x.com/i/api/graphql/Gb-d6r0vxPOADdG62OEBpQ/UserByScreenName"
+TW_GQL_FEATURES = {
+    "articles_preview_enabled": True,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "verified_phone_label_enabled": False,
+    "view_counts_everywhere_api_enabled": True,
+}
+
+_TW_AT_RE = re.compile(r'"auth_token"\s*:\s*"([0-9a-fA-F]{40})"')
+_TW_CT0_RE = re.compile(r'"ct0"\s*:\s*"([0-9a-fA-F]{32,160})"')
+_TW_USER_RE = re.compile(r'"(?:username|screen_name|handle)"\s*:\s*"([A-Za-z0-9_]{2,20})"')
+
+
+def extract_twitter_sessions(text: str, limit: int = 3) -> list[dict[str, Any]]:
+    """Пары auth_token+ct0 (полные hex-значения) + username из того же объекта."""
+    out: list[dict[str, Any]] = []
+    for m in _TW_AT_RE.finditer(text):
+        window = text[max(0, m.start() - 300): m.start() + 400]
+        cm = _TW_CT0_RE.search(window)
+        if not cm:
+            continue
+        if any(s["auth_token"] == m.group(1) for s in out):
+            continue
+        um = _TW_USER_RE.search(window)
+        out.append({"auth_token": m.group(1), "ct0": cm.group(1),
+                    "username": um.group(1) if um else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _tw_find(obj: Any, key: str) -> Any:
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _tw_find(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _tw_find(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+async def verify_twitter_session(session: aiohttp.ClientSession, auth_token: str,
+                                 ct0: str, screen_name: str | None = None,
+                                 proxy: str | None = None,
+                                 timeout_s: float = 8.0) -> dict[str, Any]:
+    """Read-only проверка cookie-сессии Twitter через GraphQL UserByScreenName."""
+    result: dict[str, Any] = {"status": "unknown", "screen_name": screen_name,
+                              "followers": None, "detail": ""}
+    if not screen_name:
+        result["detail"] = "нет username рядом с сессией"
+        return result
+    try:
+        params = {"variables": json.dumps({"screen_name": screen_name}),
+                  "features": json.dumps(TW_GQL_FEATURES)}
+        headers = {
+            "Authorization": f"Bearer {TW_WEB_BEARER}",
+            "X-CSRF-Token": ct0,
+            "x-twitter-auth-type": "OAuth2Cookie",
+            "x-twitter-active-user": "yes",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        }
+        async with session.get(
+            TW_USER_BY_SN_URL, params=params,
+            cookies={"auth_token": auth_token, "ct0": ct0},
+            headers=headers, proxy=proxy, timeout=timeout_s,
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                core = _tw_find(data, "core") or {}
+                followers = _tw_find(data, "followers_count")
+                if followers is None:
+                    followers = _tw_find(data, "followers")
+                result.update(status="valid",
+                              screen_name=core.get("screen_name") or screen_name,
+                              followers=followers)
+                followers = result["followers"]
+                result["detail"] = f"@{result['screen_name']}" + \
+                    (f", {followers} подписчиков" if followers is not None else "")
+            elif resp.status == 429:
+                result.update(status="valid", detail="rate limit (сессия жива)")
+            elif resp.status in (401, 403, 404):
+                result.update(status="invalid", detail=f"HTTP {resp.status}")
             else:
                 result["detail"] = f"HTTP {resp.status}"
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:

@@ -22,6 +22,7 @@ from .ai_verify import (
     extract_telegram_bots,
     extract_twilio_pairs,
     extract_twitter_bearers,
+    extract_twitter_sessions,
     verify_ai_key,
     verify_aws_keypair,
     verify_cryptopay_key,
@@ -30,6 +31,7 @@ from .ai_verify import (
     verify_telegram_bot,
     verify_twilio_pair,
     verify_twitter_bearer,
+    verify_twitter_session,
 )
 from .config import Settings
 from .models import HostRow, CheckResult
@@ -140,6 +142,11 @@ SENSITIVE_PATTERNS = {
     "cryptopay_key": re.compile(
         r'(?i)(?:"(?:heleket|cryptomus|nowpayments|plisio)[_-][a-z0-9_-]{0,20}(?:api[_-]?key|apikey)"\s*:\s*"[A-Za-z0-9_-]{20,}"'
         r'|\b(?:heleket|cryptomus|nowpayments|plisio)(?![a-z0-9])[\s\S]{0,200}"[a-z0-9_-]{0,24}(?:api[_-]?key|apikey)"\s*:\s*"[A-Za-z0-9_-]{20,}")'),
+    # Twitter/X сессия: пара auth_token+ct0 (cookies аккаунта, полный доступ);
+    # значения могут быть полными hex или маскированными "xxxx...xxxx"
+    "twitter_session": re.compile(
+        r'"auth_token"\s*:\s*"[0-9a-fA-F.]{8,170}"[^{}]{0,250}"ct0"\s*:\s*"[0-9a-fA-F.]{8,170}"'
+        r'|"ct0"\s*:\s*"[0-9a-fA-F.]{8,170}"[^{}]{0,250}"auth_token"\s*:\s*"[0-9a-fA-F.]{8,170}"', re.I),
     # Money rule: разрешение вывода средств в конфиге/ответе
     "withdraw_flag": re.compile(r'"(?:can_withdraw|withdraw_enabled|withdrawal_enabled|allow_withdraw)"\s*:\s*"?(?:true|1)"?'),
 
@@ -406,6 +413,8 @@ SEVERITY_MAP = {
     "dropbox_token_valid": "HIGH",
     "twilio_pair_valid": "HIGH",
     "twitter_token_valid": "MEDIUM",
+    "twitter_session": "CRITICAL",
+    "twitter_session_valid": "CRITICAL",
     "card_number": "HIGH",
     "cryptopay_key": "HIGH",
     "cryptopay_key_valid": "CRITICAL",
@@ -643,6 +652,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             secrets_found: set[tuple[str, str]] = set()
             twilio_pairs_found: set[tuple[str, str]] = set()
             twitter_bearers_found: set[str] = set()
+            twitter_sessions_found: list[dict[str, Any]] = []
             exchange_pairs_found: list[dict[str, Any]] = []
             exchange_pairs_seen: set[tuple[str, str, str]] = set()
             cryptopay_keys_found: list[dict[str, Any]] = []
@@ -737,6 +747,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 if cfg.twitter_checks:
                                     twitter_bearers_found.update(
                                         extract_twitter_bearers(body[:100_000]))
+                                    for tses in extract_twitter_sessions(body[:100_000]):
+                                        if not any(t["auth_token"] == tses["auth_token"]
+                                                   for t in twitter_sessions_found):
+                                            twitter_sessions_found.append(tses)
                                 if cfg.exchange_checks:
                                     for p in extract_exchange_pairs(body[:100_000]):
                                         sig = (p["exchange"], p["key"], p["secret"])
@@ -911,6 +925,23 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 severity_order.get(max_severity, 0):
                             max_severity = SEVERITY_MAP["twitter_token_valid"]
 
+            # Twitter/X сессии (cookies auth_token+ct0 из чекер-панелей)
+            twitter_session_checks: list[dict[str, Any]] = []
+            if cfg.twitter_checks and twitter_sessions_found:
+                for tses in twitter_sessions_found[: cfg.twitter_session_max]:
+                    chk = await verify_twitter_session(
+                        session, tses["auth_token"], tses["ct0"],
+                        screen_name=tses["username"],
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    chk["username"] = tses["username"]
+                    twitter_session_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("twitter_session_valid")
+                        if severity_order.get(SEVERITY_MAP["twitter_session_valid"], 0) > \
+                                severity_order.get(max_severity, 0):
+                            max_severity = SEVERITY_MAP["twitter_session_valid"]
+
             # Биржевые ключи: HMAC, read-only — баланс + право вывода (связка)
             exchange_checks: list[dict[str, Any]] = []
             if cfg.exchange_checks and exchange_pairs_found:
@@ -949,6 +980,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             money_verified = (
                 any(c.get("status") == "valid" for c in exchange_checks)
                 or any(c.get("status") == "valid" for c in cryptopay_checks)
+                or any(c.get("status") == "valid" for c in twitter_session_checks)
                 or any(c.get("status") == "valid" and c.get("money") for c in telegram_checks)
                 or any(c.get("status") == "valid" and c.get("kind") == "stripe" for c in secret_checks)
                 or any(c.get("status") == "auth_ok" for c in dsn_checks)
@@ -1000,6 +1032,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "secret_checks": secret_checks,
                 "twilio_checks": twilio_checks,
                 "twitter_checks": twitter_checks,
+                "twitter_session_checks": twitter_session_checks,
                 "exchange_checks": exchange_checks,
                 "cryptopay_checks": cryptopay_checks,
             }

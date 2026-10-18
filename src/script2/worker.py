@@ -160,6 +160,16 @@ class Worker:
                         row.host,
                         row.port,
                     )
+            for chk in result.data.get("twitter_session_checks") or []:
+                if chk.get("status") == "valid":
+                    log.info(
+                        "TWITTER_SESSION_VALID id=%d ip=%s:%d user=%s %s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("username") or "?",
+                        chk.get("detail") or "",
+                    )
             for chk in result.data.get("exchange_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(
