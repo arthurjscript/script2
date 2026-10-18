@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     exchange_checks: bool = True
     exchange_max: int = 3
 
+    # Крипто-платёжки с выплатами: heleket/cryptomus/nowpayments/plisio
+    cryptopay_checks: bool = True
+    cryptopay_max: int = 3
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""

@@ -178,6 +178,16 @@ class Worker:
                     row.host,
                     row.port,
                 )
+            for chk in result.data.get("cryptopay_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "CRYPTOPAY_KEY_VALID id=%d ip=%s:%d service=%s balances=%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        chk.get("service"),
+                        chk.get("detail") or "",
+                    )
             for chk in result.data.get("aws_key_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

@@ -951,3 +951,140 @@ async def verify_exchange_keypair(session: aiohttp.ClientSession, exchange: str,
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         result["detail"] = type(exc).__name__
     return result
+
+
+# ---------------------------------------------------------------------------
+# Крипто-платёжные процессоры с выплатами (heleket, cryptomus, nowpayments,
+# plisio): API-ключ = приём платежей + выплаты, проверяем баланс (read-only)
+# ---------------------------------------------------------------------------
+# (?![a-z0-9]) вместо \b: допускаем префикс в имени поля (nowpayments_api_key)
+CRYPTOPAY_CTX_RE = re.compile(r'(?i)\b(heleket|cryptomus|nowpayments|plisio)(?![a-z0-9])')
+_CP_KEY_RE = re.compile(
+    r'"(?:[a-z0-9_-]{0,24})?(?:api[_-]?key|apikey|payment[_-]?api[_-]?key|payout[_-]?api[_-]?key|secret[_-]?key)"'
+    r'\s*:\s*"([A-Za-z0-9_-]{20,64})"', re.I)
+_CP_MERCHANT_RE = re.compile(
+    r'"(?:merchant(?:[_-](?:id|uuid))?|merchantId|shop[_-]?id)"\s*:\s*"?'
+    r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"?', re.I)
+
+
+def extract_cryptopay_keys(text: str, limit: int = 3) -> list[dict[str, Any]]:
+    """API-ключи крипто-платёжек рядом с названием сервиса (+merchant UUID)."""
+    out: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+    for m in CRYPTOPAY_CTX_RE.finditer(text):
+        service = m.group(1).lower()
+        window = text[max(0, m.start() - 600): m.start() + 900]
+        km = _CP_KEY_RE.search(window)
+        if not km:
+            continue
+        mm = _CP_MERCHANT_RE.search(window)
+        sig = (service, km.group(1), mm.group(1) if mm else None)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        out.append({"service": service, "key": km.group(1),
+                    "merchant": mm.group(1) if mm else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _md5_hex(s: str) -> str:
+    return hashlib.md5(s.encode()).hexdigest()
+
+
+def _collect_balances(obj: Any, out: list[str]) -> None:
+    """Рекурсивно собирает пары валюта=баланс из произвольного JSON ответа."""
+    if isinstance(obj, dict):
+        cc = obj.get("currency_code") or obj.get("currency") or obj.get("coin")
+        bal = obj.get("balance") if obj.get("balance") is not None else obj.get("available_amount")
+        if isinstance(cc, str) and bal is not None and float(bal or 0) > 0:
+            out.append(f"{cc}={bal}")
+        for v in obj.values():
+            _collect_balances(v, out)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_balances(v, out)
+
+
+async def verify_cryptopay_key(session: aiohttp.ClientSession, service: str,
+                               key: str, merchant: str | None = None,
+                               proxy: str | None = None,
+                               timeout_s: float = 8.0) -> dict[str, Any]:
+    """Read-only проверка ключа крипто-платёжки + баланс (выплаты возможны)."""
+    result: dict[str, Any] = {"service": service, "key": key[:10] + "…",
+                              "status": "unknown", "detail": "", "balances": []}
+    try:
+        if service in ("heleket", "cryptomus"):
+            if not merchant:
+                result["detail"] = "нет merchant uuid"
+                return result
+            if service == "heleket":
+                # sign = md5(base64("") + api_key) = md5(api_key), тело пустое
+                url, body, sign = "https://api.heleket.com/v1/balance", "", _md5_hex(key)
+            else:
+                # cryptomus подписывает тело запроса "[]"
+                url, body, sign = "https://api.cryptomus.com/v1/balance", "[]", _md5_hex("[]" + key)
+            headers = {"merchant": merchant, "sign": sign,
+                       "Content-Type": "application/json"}
+            async with session.post(url, data=body.encode(), headers=headers,
+                                   proxy=proxy, timeout=timeout_s) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if data.get("state") == 0:
+                        bals: list[str] = []
+                        _collect_balances(data.get("result"), bals)
+                        result.update(status="valid", balances=bals[:8],
+                                      detail=", ".join(bals[:5]) if bals else "баланс 0")
+                    else:
+                        result.update(status="invalid",
+                                      detail=f"state={data.get('state')} {str(data.get('message') or '')[:40]}")
+                elif resp.status in (401, 403, 422):
+                    result.update(status="invalid", detail=f"HTTP {resp.status}")
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif service == "nowpayments":
+            async with session.get(
+                "https://api.nowpayments.io/v1/balance",
+                headers={"x-api-key": key}, proxy=proxy, timeout=timeout_s,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    bals = []
+                    _collect_balances(data, bals)
+                    result.update(status="valid", balances=bals[:8],
+                                  detail=", ".join(bals[:5]) if bals else "баланс 0")
+                elif resp.status == 401:
+                    result.update(status="invalid", detail="HTTP 401")
+                elif resp.status == 403:
+                    # невалидный ключ тоже даёт 403, но с code=INVALID_API_KEY
+                    data = await resp.json(content_type=None)
+                    if (data or {}).get("code") == "INVALID_API_KEY":
+                        result.update(status="invalid", detail="неверный ключ")
+                    else:
+                        result.update(status="valid", detail="нет payout-прав")
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif service == "plisio":
+            async with session.get(
+                "https://plisio.net/api/v1/operations", params={"api_key": key},
+                proxy=proxy, timeout=timeout_s,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    if data.get("status") == "success":
+                        bals: list[str] = []
+                        _collect_balances(data.get("data"), bals)
+                        result.update(status="valid", balances=bals[:8],
+                                      detail=", ".join(bals[:5]) if bals else "доступ к операциям")
+                    else:
+                        result.update(status="invalid", detail=str(data.get("data"))[:40])
+                elif resp.status in (401, 403, 422):
+                    result.update(status="invalid", detail=f"HTTP {resp.status}")
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        else:
+            result["detail"] = f"unknown service {service}"
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
