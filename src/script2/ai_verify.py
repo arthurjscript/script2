@@ -33,6 +33,8 @@ KEY_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     # fish.audio (TTS): ключ вида sk-fish-... с дефисами — generic openai-паттерн
     # его не берёт (там только [A-Za-z0-9])
     ("fish", re.compile(r'\bsk-fish-[A-Za-z0-9_-]{20,}')),
+    # Яндекс OAuth-токены: доступ к Директу/Метрике/Паспорту — деньги в кампаниях
+    ("yandex_direct", re.compile(r'\by0_[A-Za-z0-9_-]{20,}')),
     # kling: доступ по JWT из пары access_key+secret_key — ловим саму пару (см. extract_ai_keys)
     # seedance: API-ключ Volcengine Ark (модели Seedance/Doubao) — ключ с контекстом
 ]
@@ -212,6 +214,76 @@ async def _verify_kling(
     return result
 
 
+async def _verify_yandex_direct(
+    session: aiohttp.ClientSession, key: str,
+    proxy: str | None, timeout_s: float,
+) -> dict[str, Any]:
+    """Проверка Yandex OAuth-токена: паспорт + Директ (кампании/расход).
+
+    read-only: clients и campaigns только на чтение. Токен без доступа к
+    Директу всё равно подтверждает личность (паспорт).
+    """
+    result: dict[str, Any] = {
+        "provider": "yandex_direct", "key": key, "status": "error",
+        "detail": "", "uncensored": False,
+    }
+    try:
+        async with session.get(
+            "https://login.yandex.ru/info?format=json",
+            headers={"Authorization": f"OAuth {key}"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as r:
+            info = await r.json(content_type=None)
+        login = (info or {}).get("login")
+        if not login:
+            result["status"] = "invalid"
+            result["detail"] = "no identity"
+            return result
+        identity = f"{login} (uid {info.get('id')})"
+        # Директ: расход по кампаниям (общий счёт) — деньги
+        detail_parts = [f"login {identity}"]
+        async with session.post(
+            "https://api.direct.yandex.com/json/v5/campaigns",
+            data=json.dumps({
+                "method": "get",
+                "params": {
+                    "SelectionCriteria": {},
+                    "FieldNames": ["Id", "Name", "Type", "Status", "State", "Funds"],
+                    "Page": {"Limit": 500},
+                },
+            }).encode(),
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json; charset=utf-8",
+                     "Accept-Language": "ru"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as r:
+            j = await r.json(content_type=None)
+        camps = ((j or {}).get("result") or {}).get("Campaigns") or []
+        if not camps and isinstance(j, dict) and j.get("error"):
+            err = (j["error"] or {}).get("error_string", "") or "no direct"
+            result["status"] = "valid"
+            result["detail"] = f"{identity} — Директ: {err}".strip(" —")
+            return result
+        spend, rest, cur = 0, 0, "RUB"
+        for c in camps:
+            f = c.get("Funds") or {}
+            saf = f.get("SharedAccountFunds") or {}
+            spend += saf.get("Spend", 0) or 0
+            rest += f.get("Rest", 0) or 0
+            if c.get("Currency"):
+                cur = c["Currency"]
+        tail = f"кампаний {len(camps)}"
+        if spend:
+            tail += f", расход {spend / 1e6:,.0f} {cur}".replace(",", " ")
+        if rest:
+            tail += f", остаток {rest / 1e6:,.0f} {cur}".replace(",", " ")
+        result["status"] = "valid"
+        result["detail"] = tail
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
 async def verify_ai_key(
     session: aiohttp.ClientSession,
     provider: str,
@@ -226,6 +298,8 @@ async def verify_ai_key(
     """
     if provider == "kling":
         return await _verify_kling(session, key, proxy, timeout_s)
+    if provider == "yandex_direct":
+        return await _verify_yandex_direct(session, key, proxy, timeout_s)
     result: dict[str, Any] = {
         "provider": provider,
         "key": key,
