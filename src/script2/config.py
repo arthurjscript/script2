@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     batch_size: int = 50
 
     # Таймауты
-    check_timeout: int = 2
+    # check_timeout: на КАЖДЫЙ HTTP-запрос (aiohttp total). Было 2 сек - на
+    # дальних/тормозящих хостах (прокси + TLS) первый же запрос часто не
+    # доживал до ответа; 8 сек - комфортно для TLS-рукопожатия через прокси
+    check_timeout: int = 8
     host_timeout: int = 600  # бюджет на сканирование всего хоста (все запросы, вкл. id-fuzz)
     lease_seconds: int = 300
     shutdown_timeout: int = 30
