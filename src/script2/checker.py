@@ -984,9 +984,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             timeout=timeout,
             connector=connector,
         ) as session:
-            # 1. "жив" только после первого полученного HTTP-ответа
+            # "жив" только после первого полученного HTTP-ответа
             # (до этого TCP-подключение ещё не гарантировало ответ);
             # исключения/таймауты -> is_alive остаётся False
+            spec = None
+            spec_path = None
+
             for path in OPENAPI_PATHS:
                 if time.monotonic() >= deadline:
                     break
