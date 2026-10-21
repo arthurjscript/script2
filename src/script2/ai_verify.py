@@ -485,8 +485,15 @@ async def verify_telegram_bot(
     return result
 
 
-# AWS access key IDs (AKIA...)
-AWS_KEY_RE = re.compile(r'\b(AKIA[0-9A-Z]{16})\b')
+# AWS access key IDs: AKIA = long-term, ASIA = временные STS-креды
+AWS_KEY_RE = re.compile(r'\b(A(?:K|S)IA[0-9A-Z]{16})\b')
+# bare secret: ровно 40-char base64, не внутри более длинной строки
+AWS_BARE_SECRET_RE = re.compile(
+    r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
+)
+AWS_SESSION_TOKEN_RE = re.compile(
+    r'"(?:aws_)?session_token"\s*:\s*"([A-Za-z0-9/+=]{20,})"', re.I
+)
 
 
 def extract_aws_keys(text: str) -> list[str]:
@@ -496,29 +503,51 @@ def extract_aws_keys(text: str) -> list[str]:
 
 # Пары access_key + secret_key в одном JSON-объекте (оба порядка полей)
 AWS_KEYPAIR_RE = re.compile(
-    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(AKIA[0-9A-Z]{16})"'
+    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(A(?:K|S)IA[0-9A-Z]{16})"'
     r'[^{}]{0,400}?'
-    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key)"\s*:\s*"([A-Za-z0-9/+=]{40})"',
+    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"([A-Za-z0-9/+=]{40})"',
     re.I,
 )
 AWS_KEYPAIR_RE_R = re.compile(
-    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key)"\s*:\s*"([A-Za-z0-9/+=]{40})"'
+    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"([A-Za-z0-9/+=]{40})"'
     r'[^{}]{0,400}?'
-    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(AKIA[0-9A-Z]{16})"',
+    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(A(?:K|S)IA[0-9A-Z]{16})"',
     re.I,
 )
 
 
-def extract_aws_keypairs(text: str) -> list[tuple[str, str]]:
-    """Извлекает пары (access_key, secret_key) из одного JSON-объекта."""
-    pairs = [(m.group(1), m.group(2)) for m in AWS_KEYPAIR_RE.finditer(text)]
-    pairs += [(m.group(2), m.group(1)) for m in AWS_KEYPAIR_RE_R.finditer(text)]
-    return list(dict.fromkeys(pairs))
+def extract_aws_keypairs(text: str) -> list[tuple[str, str, str]]:
+    """Пары (access_key, secret_key, session_token) из одного тела.
+
+    Сначала JSON-пары (оба порядка полей), затем fallback: bare access key
+    без пары - кандидат в секрет ищем рядом (окно ±160 символов, ровно
+    40-char base64). Ложные кандидаты безопасны: STS вернёт invalid.
+    """
+    seen: dict[tuple[str, str], str] = {}
+    sess_tokens = AWS_SESSION_TOKEN_RE.findall(text)
+    token = sess_tokens[0] if sess_tokens else ""
+
+    for m in AWS_KEYPAIR_RE.finditer(text):
+        seen.setdefault((m.group(1), m.group(2)), token)
+    for m in AWS_KEYPAIR_RE_R.finditer(text):
+        seen.setdefault((m.group(2), m.group(1)), token)
+
+    # bare-ключи, не покрытые JSON-парой
+    for ak in dict.fromkeys(AWS_KEY_RE.findall(text)):
+        if any(k == ak for k, _ in seen):
+            continue
+        for m in re.finditer(r'\b' + ak + r'\b', text[:100_000]):
+            seg = text[max(0, m.start() - 160): m.end() + 160]
+            cand = AWS_BARE_SECRET_RE.search(seg)
+            if cand and cand.group(0) != ak:
+                seen.setdefault((ak, cand.group(0)), token)
+                break
+    return [(ak, sk, tok) for (ak, sk), tok in seen.items()]
 
 
 def _sigv4_auth(
     access_key: str, secret_key: str, amzdate: str, datestamp: str,
-    body: str,
+    body: str, session_token: str = "",
 ) -> str:
     """Authorization-заголовок SigV4 для POST sts.amazonaws.com (query protocol)."""
     import hashlib
@@ -534,6 +563,9 @@ def _sigv4_auth(
         f'x-amz-date:{amzdate}\n'
     )
     signed_headers = 'content-type;host;x-amz-date'
+    if session_token:
+        canonical_headers += f'x-amz-security-token:{session_token}\n'
+        signed_headers = 'content-type;host;x-amz-date;x-amz-security-token'
     canonical_request = (
         f'POST\n/\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}'
     )
@@ -558,12 +590,14 @@ async def verify_aws_keypair(
     session: aiohttp.ClientSession,
     access_key: str,
     secret_key: str,
+    session_token: str = "",
     proxy: str | None = None,
     timeout_s: float = 5.0,
 ) -> dict[str, Any]:
     """Проверяет пару AWS-ключей через STS GetCallerIdentity (SigV4).
 
     Бесплатно и безопасно: только читает identity (account ID, ARN).
+    session_token обязателен для ASIA-ключей (временные STS-креды).
     """
     result: dict[str, Any] = {
         "access_key": access_key, "status": "error",
@@ -578,8 +612,13 @@ async def verify_aws_keypair(
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
             'X-Amz-Date': amzdate,
-            'Authorization': _sigv4_auth(access_key, secret_key, amzdate, datestamp, body),
+            'Authorization': _sigv4_auth(
+                access_key, secret_key, amzdate, datestamp, body,
+                session_token=session_token,
+            ),
         }
+        if session_token:
+            headers['X-Amz-Security-Token'] = session_token
         timeout = aiohttp.ClientTimeout(total=timeout_s)
         async with session.post(
             'https://sts.amazonaws.com/', data=body, headers=headers,
@@ -908,10 +947,10 @@ async def verify_secret(
 # Верификация read-only: GET {site}/wp-json/wp/v2/users/me, Basic auth.
 # ---------------------------------------------------------------------------
 WP_PAIR_RE = re.compile(
-    r'"wp_user"\s*:\s*"([^"]{1,80})"[^{}]{0,300}?"wp_password"\s*:\s*"([^"]{4,})"', re.I)
+    r'"wp_user(?:name)?"\s*:\s*"([^"]{1,80})"[^{}]{0,300}?"(?:wp_password|wp_pass)"\s*:\s*"([^"]{4,})"', re.I)
 WP_SITE_ENTRY_RE = re.compile(
-    r'"(?:url|site_url|domain)"\s*:\s*"([^"]{1,200})"[^{}]{0,400}?"wp_user"\s*:\s*"([^"]{1,80})"'
-    r'[^{}]{0,300}?"wp_password"\s*:\s*"([^"]{4,})"', re.I)
+    r'"(?:url|site_url|domain)"\s*:\s*"([^"]{1,200})"[^{}]{0,400}?"wp_user(?:name)?"\s*:\s*"([^"]{1,80})"'
+    r'[^{}]{0,300}?"(?:wp_password|wp_pass)"\s*:\s*"([^"]{4,})"', re.I)
 
 
 def extract_wp_creds(text: str, fallback_url: str = "") -> list[dict[str, str]]:
@@ -996,15 +1035,74 @@ async def probe_wp_sites(session: aiohttp.ClientSession, base_url: str,
             if not isinstance(data, list):
                 return out
             for entry in data:
-                if isinstance(entry, dict) and entry.get("wp_user") and entry.get("wp_password"):
+                if not isinstance(entry, dict):
+                    continue
+                user = entry.get("wp_user") or entry.get("wp_username")
+                pwd = entry.get("wp_password") or entry.get("wp_pass")
+                if user and pwd:
                     out.append({
                         "site_url": entry.get("url") or "",
-                        "user": str(entry["wp_user"]),
-                        "password": str(entry["wp_password"]),
+                        "user": str(user),
+                        "password": str(pwd),
                     })
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError):
         return out
     return out
+
+
+# Активная проба WordPress: хост сам может быть WP-админкой.
+# Только read-only GET, короткий таймаут, без брутфорса.
+WP_LOGIN_MARKERS = ("wp-admin", "wp-content", "user_pass", "wp-submit")
+
+
+async def probe_wp_admin(session: aiohttp.ClientSession, base_url: str,
+                         proxy: str | None = None,
+                         timeout_s: float = 8.0) -> dict[str, Any]:
+    """Проба WP-админки на самом хосте.
+
+    1) GET /wp-login.php - форма логина (маркеры wp-admin/wp-content).
+    2) GET /wp-json/wp/v2/users - unauth-перечисление пользователей REST
+       (классика: раскрывает логины, часто админские).
+    """
+    result: dict[str, Any] = {
+        "probe": "wp_admin", "login": False, "users_enum": False,
+        "users": "", "detail": "",
+    }
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; scanner)"}
+    try:
+        async with session.get(
+            base_url.rstrip("/") + "/wp-login.php",
+            headers=headers, proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            allow_redirects=True,
+        ) as resp:
+            if resp.status == 200:
+                text = await resp.text(content_type=None)
+                if any(m in text.lower() for m in WP_LOGIN_MARKERS):
+                    result["login"] = True
+    except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+        result["detail"] = type(exc).__name__
+        return result
+    try:
+        async with session.get(
+            base_url.rstrip("/") + "/wp-json/wp/v2/users?per_page=10",
+            headers={**headers, "Accept": "application/json"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, list) and data:
+                    names = [
+                        str(u.get("slug") or u.get("name") or "")
+                        for u in data if isinstance(u, dict)
+                    ]
+                    names = [n for n in names if n]
+                    if names:
+                        result["users_enum"] = True
+                        result["users"] = ", ".join(names)[:300]
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError):
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------

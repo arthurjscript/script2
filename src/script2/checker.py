@@ -26,6 +26,7 @@ from .ai_verify import (
     extract_twitter_sessions,
     extract_wp_creds,
     extract_integrations,
+    probe_wp_admin,
     probe_wp_sites,
     verify_ai_key,
     verify_aws_keypair,
@@ -215,9 +216,11 @@ SENSITIVE_PATTERNS = {
     "auth_token": re.compile(r'"auth_token"\s*:\s*"[^"]{16,}"', re.I),
     "bearer_token": re.compile(r'"bearer"\s*:\s*"[^"]{16,}"', re.I),
     "jwt_token": re.compile(r'"jwt"\s*:\s*"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"'),
-    # HIGH - AWS
-    "aws_access_key": re.compile(r'AKIA[0-9A-Z]{16}'),
-    "aws_secret_key": re.compile(r'"(?:aws_secret|secret_access_key|aws_secret_access_key)"\s*:\s*"[A-Za-z0-9/+=]{40}"'),
+    # HIGH - AWS. ASIA = временные STS-креды (без session_token не верифицируются)
+    "aws_access_key": re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
+    "aws_secret_key": re.compile(
+        r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"[A-Za-z0-9/+=]{40}"', re.I),
+    "aws_session_token": re.compile(r'"aws_session_token"\s*:\s*"[A-Za-z0-9/+=]{20,}"', re.I),
     # HIGH - Exchange
     "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # AI/SaaS API-ключи: уникальные префиксы провайдеров + generic api_key поля.
@@ -277,10 +280,12 @@ SENSITIVE_PATTERNS = {
 
     # TEST - проверить и удалить ненужные
     "admin_password": re.compile(r'"admin_password"\s*:\s*"[^"]{3,}"', re.I),
-    # WordPress админ-креды в API-ответах (см. extract_wp_creds для пар)
-    "wp_user": re.compile(r'"wp_user"\s*:\s*"[^"]{1,80}"', re.I),
-    "wp_password": re.compile(r'"wp_password"\s*:\s*"[^"]{4,}"', re.I),
-    "wp_auth_key": re.compile(r'"(?:auth_key|secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
+    # WordPress админ-креды в API-ответах (см. extract_wp_creds для пар).
+    # user_login/application_password не ловим - поля мусорных доступов, шум.
+    "wp_user": re.compile(r'"wp_user(?:name)?"\s*:\s*"[^"]{1,80}"', re.I),
+    "wp_password": re.compile(r'"(?:wp_password|wp_pass)"\s*:\s*"[^"]{4,}"', re.I),
+    # голый auth_key ловит чужие системы (RADIUS /health) - только WP-специфичные
+    "wp_auth_key": re.compile(r'"(?:secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
     "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
     "db_password": re.compile(r'"(?:db_password|DB_PASSWORD)"\s*:\s*"[^"]{3,}"'),
 
@@ -541,6 +546,7 @@ SEVERITY_MAP = {
     "jwt_token": "HIGH",
     "aws_access_key": "HIGH",
     "aws_secret_key": "HIGH",
+    "aws_session_token": "HIGH",
     "binance_key": "HIGH",
     "ai_apikey": "HIGH",
     "ai_key_valid": "HIGH",
@@ -580,6 +586,9 @@ SEVERITY_MAP = {
     "wp_salt": "HIGH",
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
+    # Активные пробы самого хоста как WP-админки
+    "wp_login_found": "MEDIUM",
+    "wp_users_enum": "HIGH",
     "integration_valid": "CRITICAL",
     "token_replay": "CRITICAL",
     "db_password": "CRITICAL",
@@ -765,7 +774,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # AI-ключи, найденные в ответах (key -> provider), для верификации
             ai_keys_found: dict[str, str] = {}
             telegram_bots_found: set[str] = set()
-            aws_keypairs_found: set[tuple[str, str]] = set()
+            aws_keypairs_found: dict[tuple[str, str, str], None] = {}
             dsns_found: set[str] = set()
             secrets_found: set[tuple[str, str]] = set()
             twilio_pairs_found: set[tuple[str, str]] = set()
@@ -892,12 +901,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 if cfg.telegram_bot_checks:
                                     telegram_bots_found.update(extract_telegram_bots(body[:100_000]))
                                 if cfg.aws_key_checks:
-                                    for access_key, secret in extract_aws_keypairs(body[:100_000]):
+                                    for access_key, secret, sess_token in extract_aws_keypairs(body[:100_000]):
                                         if (
                                             not is_aws_example_key(access_key)
                                             and not secret.endswith('EXAMPLEKEY')
                                         ):
-                                            aws_keypairs_found.add((access_key, secret))
+                                            aws_keypairs_found.setdefault((access_key, secret, sess_token), None)
                                 if cfg.dsn_checks:
                                     dsns_found.update(
                                         d for d in extract_dsns(body[:100_000])
@@ -924,8 +933,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                                 and len(auth_tokens_found) < cfg.token_replay_max:
                                             auth_tokens_found.append(tok)
                                 if cfg.wp_checks:
-                                    # маркер + извлечение пар (url можно взять из entry)
-                                    if '"wp_user"' in body or '"wp_password"' in body:
+                                    # маркер + извлечение пар (url можно взять из entry);
+                                    # без закрывающей кавычки - ловит и wp_username
+                                    if '"wp_user' in body or '"wp_pass' in body:
                                         wp_panel_seen = True
                                     wp_pairs_found.extend(
                                         extract_wp_creds(body[:100_000], fallback_url=base_url))
@@ -1110,7 +1120,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if cfg.secret_checks:
                                             secrets_found.update(extract_secrets(fbody[:100_000]))
                                         if cfg.wp_checks:
-                                            if '"wp_user"' in fbody or '"wp_password"' in fbody:
+                                            if '"wp_user' in fbody or '"wp_pass' in fbody:
                                                 wp_panel_seen = True
                                             wp_pairs_found.extend(
                                                 extract_wp_creds(fbody[:100_000], fallback_url=base_url))
@@ -1186,7 +1196,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 if cfg.secret_checks:
                                     secrets_found.update(extract_secrets(rbody[:100_000]))
                                 if cfg.wp_checks:
-                                    if '"wp_user"' in rbody or '"wp_password"' in rbody:
+                                    if '"wp_user' in rbody or '"wp_pass' in rbody:
                                         wp_panel_seen = True
                                     wp_pairs_found.extend(
                                         extract_wp_creds(rbody[:100_000], fallback_url=base_url))
@@ -1240,9 +1250,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # Проверка AWS-пар: STS GetCallerIdentity (SigV4, через прокси)
             aws_key_checks: list[dict[str, Any]] = []
             if cfg.aws_key_checks and aws_keypairs_found:
-                for access_key, secret in list(aws_keypairs_found)[: cfg.aws_key_max]:
+                for access_key, secret, sess_token in list(aws_keypairs_found)[: cfg.aws_key_max]:
                     chk = await verify_aws_keypair(
-                        session, access_key, secret,
+                        session, access_key, secret, session_token=sess_token,
                         proxy=proxy, timeout_s=max(cfg.check_timeout, 5),
                     )
                     aws_key_checks.append(chk)
@@ -1408,6 +1418,22 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 max_severity = "CRITICAL"
                         if len(wp_checks) >= cfg.wp_verify_max:
                             break
+
+            # Активная проба самого хоста как WordPress-админки: не только
+            # утечки wp_user в чужих панелях, но и живые wp-login.php /
+            # REST-перечисление пользователей. Read-only GET, короткий таймаут.
+            if cfg.wp_checks:
+                wp_probe = await probe_wp_admin(session, base_url, proxy=proxy)
+                if wp_probe.get("login"):
+                    all_patterns.append("wp_login_found")
+                    if severity_order.get(max_severity, 0) < 1:
+                        max_severity = "MEDIUM"
+                if wp_probe.get("users_enum"):
+                    all_patterns.append("wp_users_enum")
+                    if severity_order.get(max_severity, 0) < 2:
+                        max_severity = "HIGH"
+                if wp_probe.get("login") or wp_probe.get("users_enum"):
+                    wp_checks.append(wp_probe)
 
             # Интеграции панелей (service_type+api_key): Bearer-проба known-
             # сервисов (clickadu balance, clickadilla profile, cloudflare).
