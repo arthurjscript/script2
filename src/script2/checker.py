@@ -868,6 +868,16 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     if UUID_VALUE_RE.match(a_val) \
                             or re.match(r'(?i)^(fake|mock|demo|test|your|example)[_\-]', a_val):
                         continue
+                # YAML-ветка на HTML/JS-страницах: строки вида
+                # "password: form.get(...)", "new_password: form.get(...)," —
+                # это JS-код, а не конфиг. Признак: скобки в значении
+                # или trailing-запятая (end of JS-объектного свойства)
+                if ":" in value_text:
+                    tail = value_text.split(":", 1)[1]
+                    if "(" in tail or "=>" in tail or tail.rstrip().endswith(",") \
+                            or ".value" in tail \
+                            or tail.lstrip().startswith(("document", "form", "window", "$(", "e", "this", "req")):
+                        continue
 
             # Токены: отсеиваем мусорные значения (fake_, даты, без цифр)
             if name in ("refresh_token", "auth_token", "bearer_token", "access_token", "session_id", "session_token"):
