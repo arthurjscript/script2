@@ -187,6 +187,20 @@ class Worker:
                         row.port,
                         (ep.get("path") or "?").split("#")[0],
                     )
+            # replay открыл АДМИНСКУЮ сессию или сессию с деньгами
+            for chk in result.data.get("token_replay_checks") or []:
+                if chk.get("admin"):
+                    log.warning(
+                        "TOKEN_REPLAY_ADMIN id=%d ip=%s:%d identity=%s opened=%d",
+                        row.id, row.host, row.port,
+                        chk.get("identity") or "?", len(chk.get("opened") or []),
+                    )
+                if chk.get("money"):
+                    log.warning(
+                        "TOKEN_REPLAY_MONEY id=%d ip=%s:%d credits=%s identity=%s",
+                        row.id, row.host, row.port,
+                        chk.get("money_value") or "?", chk.get("identity") or "?",
+                    )
             for chk in result.data.get("twilio_checks") or []:
                 if chk.get("status") == "valid":
                     log.warning(

