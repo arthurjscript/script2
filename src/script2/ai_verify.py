@@ -1787,7 +1787,75 @@ async def verify_cryptopay_key(session: aiohttp.ClientSession, service: str,
 
 
 # ---------------------------------------------------------------------------
-# Facebook: EAA access-токены (аккаунты). Верификация read-only GET /me.
+# Login-проверка: найденная пара логин+пароль пробуется на login-эндпоинте
+# ОДНОЙ попыткой (не брутфорс - проверка утёкшего секрета). POST = side
+# effect (создание сессии), одобрено юзером 2026-10-21.
+# ---------------------------------------------------------------------------
+LOGIN_VALID_TOKEN_RE = re.compile(
+    r'"(?:access_token|token|jwt|session_id|session|refresh_token|sessionId)"\s*:\s*"[^"]{8,}"', re.I)
+LOGIN_ADMIN_RE = re.compile(
+    r'"(?:role|user_role|roles?)"\s*:\s*"?(?:admin|superadmin|super_admin|superuser)"?'
+    r'|"(?:is_admin|is_superuser)"\s*:\s*(?:true|1)\b', re.I)
+LOGIN_INVALID_RE = re.compile(r'(?i)(invalid|incorrect|wrong|unauthorized|ошиб|неверн)')
+
+
+async def check_login(
+    session: aiohttp.ClientSession, base_url: str, path: str,
+    user: str, password: str,
+    proxy: str | None = None, timeout_s: float = 10.0,
+) -> dict[str, Any]:
+    """Одна попытка login POST с УТЁКШЕЙ парой.
+
+    200 + токен/профиль в ответе = валидный аккаунт (чекер).
+    """
+    result: dict[str, Any] = {
+        "user": user, "password": password, "endpoint": path,
+        "status": "error", "detail": "", "admin": False, "token": "",
+    }
+    body_fields = {"email": user, "password": password} if "@" in user \
+        else {"username": user, "password": password}
+    try:
+        async with session.post(
+            base_url.rstrip("/") + path, json=body_fields,
+            headers={"Accept": "application/json"},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                try:
+                    data = await resp.json(content_type=None)
+                except (ValueError, TypeError):
+                    data = None
+                text = json.dumps(data, ensure_ascii=False) if data is not None \
+                    else (await resp.text())[:2000]
+                m = LOGIN_VALID_TOKEN_RE.search(text)
+                if m:
+                    result["status"] = "valid"
+                    tok_m = re.search(
+                        r'"(?:access_token|token|jwt|session)"\s*:\s*"([^"]{8,})"', text, re.I)
+                    if tok_m:
+                        result["token"] = tok_m.group(1)
+                    if LOGIN_ADMIN_RE.search(text):
+                        result["admin"] = True
+                    result["detail"] = f"login {user}" + (" — ADMIN" if result["admin"] else "")
+                elif isinstance(data, dict) and (data.get("id") or data.get("user") or data.get("success")) \
+                        and not LOGIN_INVALID_RE.search(text):
+                    result["status"] = "valid"
+                    result["detail"] = f"login {user} (профиль)"
+                else:
+                    result["status"] = "invalid"
+                    result["detail"] = "нет токена/профиля в ответе"
+            elif resp.status in (400, 401, 403, 422):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Facebook: EAA access-токены (аккаунты). Верификация read-only GET graph /me.
 # ---------------------------------------------------------------------------
 FACEBOOK_TOKEN_RE = re.compile(
     r'"(?:access_token|page_access_token)"\s*:\s*"(EAA[A-Za-z0-9]{50,})"')

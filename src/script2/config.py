@@ -93,6 +93,23 @@ class Settings(BaseSettings):
     key_balance_checks: bool = True
     key_balance_max: int = 3
 
+    # Replay остальных видов входа (инфраструктура token_replay):
+    # cookie-сессии (session_id/sid -> Cookie), найденные креды
+    # (пара логин+пароль / Basic -> Authorization: Basic), api_key
+    # (-> X-API-Key) в protected GET. Только GET - пассивно
+    session_replay: bool = True
+    session_replay_max: int = 2
+    cred_replay: bool = True
+    cred_replay_max: int = 2
+    apikey_replay: bool = True
+    apikey_replay_max: int = 2
+
+    # Login-проверка: найденная пара логин+пароль пробуется на
+    # login-эндпоинте ОДНОЙ попыткой (не брутфорс - утёкший секрет).
+    # POST (создание сессии) - одобрено юзером 2026-10-21
+    login_checks: bool = True
+    login_check_max: int = 2
+
     # id-fuzz: id'шники из тел подставляются в GET-шаблоны с {param}
     # (второй проход по тем же детекторам/экстракторам). Лимит на
     # идентичный GET-эндпоинт поднят: 60 значений на параметр, 15 шаблонов,

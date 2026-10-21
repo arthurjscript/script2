@@ -177,29 +177,39 @@ class Worker:
                         "KEY_BALANCE_MONEY id=%d ip=%s:%d %s",
                         row.id, row.host, row.port, chk.get("detail") or "",
                     )
-            # token replay: access_token открыл protected GET (auth bypass)
+            # replay: вход (bearer/session/cred/apikey) открыл protected GET
             for ep in result.data.get("vulnerable") or []:
-                if "token_replay" in (ep.get("patterns") or []):
-                    log.warning(
-                        "TOKEN_REPLAY id=%d ip=%s:%d path=%s",
-                        row.id,
-                        row.host,
-                        row.port,
-                        (ep.get("path") or "?").split("#")[0],
-                    )
-            # replay открыл АДМИНСКУЮ сессию или сессию с деньгами
+                for tag in ("token_replay", "session_replay", "cred_replay", "apikey_replay"):
+                    if tag in (ep.get("patterns") or []):
+                        log.warning(
+                            "REPLAY id=%d ip=%s:%d kind=%s path=%s",
+                            row.id, row.host, row.port, tag,
+                            (ep.get("path") or "?").split("#")[0],
+                        )
+                        break
+            # вход открыл АДМИНСКУЮ сессию или сессию с деньгами
             for chk in result.data.get("token_replay_checks") or []:
+                kind = chk.get("kind") or "bearer"
                 if chk.get("admin"):
                     log.warning(
-                        "TOKEN_REPLAY_ADMIN id=%d ip=%s:%d identity=%s opened=%d",
-                        row.id, row.host, row.port,
+                        "REPLAY_ADMIN id=%d ip=%s:%d kind=%s identity=%s opened=%d",
+                        row.id, row.host, row.port, kind,
                         chk.get("identity") or "?", len(chk.get("opened") or []),
                     )
                 if chk.get("money"):
                     log.warning(
-                        "TOKEN_REPLAY_MONEY id=%d ip=%s:%d credits=%s identity=%s",
-                        row.id, row.host, row.port,
+                        "REPLAY_MONEY id=%d ip=%s:%d kind=%s credits=%s identity=%s",
+                        row.id, row.host, row.port, kind,
                         chk.get("money_value") or "?", chk.get("identity") or "?",
+                    )
+            # найденный кред открыл login-эндпоинт (валидный аккаунт)
+            for chk in result.data.get("login_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "LOGIN_VALID id=%d ip=%s:%d user=%s%s %s",
+                        row.id, row.host, row.port, chk.get("user") or "?",
+                        " ADMIN" if chk.get("admin") else "",
+                        chk.get("detail") or "",
                     )
             for chk in result.data.get("twilio_checks") or []:
                 if chk.get("status") == "valid":
