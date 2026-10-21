@@ -973,20 +973,18 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             timeout=timeout,
             connector=connector,
         ) as session:
-            # 1. TCP alive check
-            result.is_alive = True
-            result.latency_ms = int((time.perf_counter() - started) * 1000)
-
-            # 2. Поиск OpenAPI спецификации
-            spec = None
-            spec_path = None
-
+            # 1. "жив" только после первого полученного HTTP-ответа
+            # (до этого TCP-подключение ещё не гарантировало ответ);
+            # исключения/таймауты -> is_alive остаётся False
             for path in OPENAPI_PATHS:
                 if time.monotonic() >= deadline:
                     break
                 try:
                     url = base_url.rstrip("/") + path
                     async with session.get(url, allow_redirects=False, proxy=proxy) as resp:
+                        if not result.is_alive:
+                            result.is_alive = True
+                            result.latency_ms = int((time.perf_counter() - started) * 1000)
                         if resp.status == 200:
                             text = await resp.text()
                             if is_openapi_spec(text):

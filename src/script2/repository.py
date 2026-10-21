@@ -73,6 +73,9 @@ WHERE id = $1 AND locked_by = $2 AND check_status = 'in_progress'
 SQL_REAP_EXPIRED = """
 UPDATE live_hosts
 SET check_status = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'retry' END,
+    -- бэкофф: экспонента от числа попыток, кап 60 минут
+    next_attempt_at = now() + make_interval(
+        secs => LEAST(power(2, GREATEST(attempts - 1, 0)) * $2, 3600)),
     last_error = 'lease expired, locked_by=' || locked_by,
     locked_by = NULL,
     locked_until = NULL
@@ -180,9 +183,18 @@ class Repository:
             )
 
     async def reap_expired(self) -> list[int]:
-        """Освобождает записи с истёкшей арендой (REAPER)."""
+        """Освобождает записи с истёкшей арендой (REAPER).
+
+        После экспирации - экспоненциальный бэкофф от числа попыток
+        (2^n * retry_base_seconds, кап 60 минут) - иначе хост сразу
+        перезахватывался и долбился снова без паузы.
+        """
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(SQL_REAP_EXPIRED, self.cfg.max_attempts)
+            rows = await conn.fetch(
+                SQL_REAP_EXPIRED,
+                self.cfg.max_attempts,
+                self.cfg.retry_base_seconds,
+            )
             return [r["id"] for r in rows]
 
     async def release_mine(self) -> list[int]:

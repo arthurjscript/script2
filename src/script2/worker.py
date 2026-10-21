@@ -37,6 +37,7 @@ class Worker:
         self.done_dead = 0
         self.retry_count = 0
         self.failed_count = 0
+        self.save_failed = 0
         self.lost_lease = 0
 
     def get_proxy(self) -> str | None:
@@ -68,7 +69,14 @@ class Worker:
             self.retry_count += 1
             return
 
-        saved = await self.repo.save_result(row.id, row.attempts, result)
+        try:
+            saved = await self.repo.save_result(row.id, row.attempts, result)
+        except Exception as exc:
+            # сохранить не вышло: транзакция откатывается, lease живёт -
+            # репёр вернёт хост в очередь с бэкоффом (до этого - молчаливо)
+            log.exception("SAVE_FAILED id=%d error=%s", row.id, repr(exc))
+            self.save_failed += 1
+            return
 
         if not saved:
             log.warning("Lost lease id=%d", row.id)
@@ -314,13 +322,14 @@ class Worker:
             # Выводим статистику раз в 60 секунд
             if time.time() - last_stats >= 60:
                 log.info(
-                    "Stats: claimed=%d alive=%d dead=%d retry=%d failed=%d lost=%d inflight=%d",
+                    "Stats: claimed=%d alive=%d dead=%d retry=%d failed=%d lost=%d save_failed=%d inflight=%d",
                     self.claimed,
                     self.done_alive,
                     self.done_dead,
                     self.retry_count,
                     self.failed_count,
                     self.lost_lease,
+                    self.save_failed,
                     len(inflight),
                 )
                 last_stats = time.time()
