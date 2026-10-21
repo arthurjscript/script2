@@ -466,7 +466,39 @@ INTERPOLATED_RE = re.compile(r'^(?:\$\{[^}]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,1
 # id-fuzz: пары "поле": значение из тел. Собираются значения полей,
 # чьи имена похожи на подстановочные параметры (id/slug/username/email/...)
 FUZZ_PAIR_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{0,64})"\s*:\s*"?([^",\[\]{}]{1,120})"?', re.I)
-FUZZ_FIELD_RE = re.compile(r'(?:^|_)(?:ids?|uuids?|guid|slug|username|user_login|login|email|code|sku|number)$', re.I)
+# word-part'ы имён полей. Пул расширен (2026-10-21): + account/user/name/
+# phone/msisdn/mobile/order/customer/client/merchant/product/item/no
+FUZZ_FIELD_RE = re.compile(
+    r'(?:^|_)(?:ids?|uuids?|guid|slug|username|user_login|login|email|code|sku|number'
+    r'|account|user|name|phone|msisdn|mobile|order|customer|client|merchant'
+    r'|product|item|no)s?$', re.I)
+# синонимы поле↔параметр: бакет fld кормит не только одноимённый параметр,
+# но и синонимы (account -> {id}, user -> {username}/{name}, phone -> {msisdn})
+FUZZ_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "id": ("account", "user", "number", "no", "code"),
+    "account": ("id", "user", "username"),
+    "user": ("id", "account", "username", "login", "name"),
+    "username": ("user", "login", "name", "email", "account"),
+    "name": ("username", "login", "user"),
+    "login": ("username", "user", "name", "email"),
+    "email": ("username", "login", "user"),
+    "phone": ("msisdn", "mobile", "number"),
+    "msisdn": ("phone", "mobile", "number"),
+    "mobile": ("phone", "msisdn", "number"),
+    "number": ("phone", "msisdn", "order", "no"),
+    "order": ("order_no", "number", "no", "code"),
+    "order_no": ("order", "number", "no"),
+    "customer": ("user", "client", "account", "id"),
+    "client": ("user", "customer", "account", "id"),
+    "merchant": ("customer", "client", "user"),
+    "product": ("item", "sku", "code", "id"),
+    "item": ("product", "sku", "id"),
+    "sku": ("product", "item", "code"),
+    "uuid": ("guid", "id"),
+    "guid": ("uuid", "id"),
+    "slug": ("code", "name", "id"),
+    "code": ("sku", "number", "no", "slug", "order"),
+}
 # token replay: access_token из 200-тел (напр. GET /api/efi/_debug/authorize)
 # подставляется в protected GET (401/403) как Authorization: Bearer
 TOKEN_RE_RE = re.compile(r'"(?:access_token|accessToken)"\s*:\s*"([^"\s]{16,512})"')
@@ -486,12 +518,13 @@ REPLAY_ID_RE = re.compile(
 
 
 def _fuzz_candidates(param: str, buckets: dict, cap: int) -> list[str]:
-    """Значения бакетов, чьи имена полей бьют в параметр шаблона
-    (exact, суффикс после _, или сам параметр длиннее: user_id -> user)."""
+    """Значения бакетов для параметра шаблона: exact/суффикс/префикс
+    (user_id -> user) + синонимы (account -> {id}, user -> {username})."""
     p = param.lower()
     out: list[str] = []
     for fld in sorted(buckets):
-        if not (fld == p or fld.endswith("_" + p) or p.endswith("_" + fld)):
+        syn = FUZZ_SYNONYMS.get(fld, ())
+        if not (fld == p or fld.endswith("_" + p) or p.endswith("_" + fld) or p in syn):
             continue
         for v in sorted(buckets[fld])[: cap]:
             if v not in out:
@@ -499,6 +532,33 @@ def _fuzz_candidates(param: str, buckets: dict, cap: int) -> list[str]:
         if len(out) >= cap:
             break
     return out[: cap]
+
+
+def _fuzz_value_variants(val: str) -> list[str]:
+    """Похожие значения - не 1-в-1, но могут бить в параметр:
+    digits-выжимка (ORD2026...A3DA -> 20260513...), email local part,
+    uuid без дефисов, нижний регистр, соседи id N -> N-1/N+1."""
+    out: list[str] = []
+    v = val.strip()
+    if not v or len(v) > 64:
+        return out
+    if v.lower() != v:
+        out.append(v.lower())
+    if "@" in v:
+        loc = v.split("@", 1)[0]
+        if 2 <= len(loc) < len(v):
+            out.append(loc)
+    if len(v) == 36 and v.count("-") == 4:
+        out.append(v.replace("-", ""))
+    digits = re.sub(r"\D", "", v)
+    if 3 <= len(digits) <= 20 and digits != v:
+        out.append(digits)
+    if v.isdigit() and 1 < len(v) <= 10:
+        n = int(v)
+        if n > 1:
+            out.append(str(n - 1))
+        out.append(str(n + 1))
+    return out
 # id'шники в JSON-телах (для id-fuzz: подставляются в GET-шаблоны с {param})
 
 
@@ -1024,6 +1084,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         bucket = fuzz_buckets.setdefault(fld, set())
                                         if len(bucket) < cfg.id_fuzz_max:
                                             bucket.add(val)
+                                        # похожие значения (digits-выжимка,
+                                        # email local, uuid-без-дефисов, соседи ±1)
+                                        for v in _fuzz_value_variants(val):
+                                            if len(bucket) >= cfg.id_fuzz_max or v in bucket:
+                                                continue
+                                            bucket.add(v)
                                 if cfg.twilio_checks:
                                     twilio_pairs_found.update(extract_twilio_pairs(body[:100_000]))
                                 if cfg.twitter_checks:
@@ -1156,6 +1222,12 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                             bucket = fuzz_buckets.setdefault(fld, set())
                                             if len(bucket) < cfg.id_fuzz_max and fval not in bucket:
                                                 bucket.add(fval)
+                                                fuzz_new = True
+                                            # похожие значения - в каскад тоже
+                                            for v in _fuzz_value_variants(fval):
+                                                if len(bucket) >= cfg.id_fuzz_max or v in bucket:
+                                                    continue
+                                                bucket.add(v)
                                                 fuzz_new = True
                                         if not fpatterns:
                                             continue

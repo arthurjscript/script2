@@ -95,12 +95,14 @@ class Settings(BaseSettings):
 
     # id-fuzz: id'шники из тел подставляются в GET-шаблоны с {param}
     # (второй проход по тем же детекторам/экстракторам). Лимит на
-    # идентичный GET-эндпоинт поднят: 50 id на шаблон, 10 шаблонов,
-    # до 5 раундов каскада (новые id из ответов -> следующий раунд)
+    # идентичный GET-эндпоинт поднят: 60 значений на параметр, 15 шаблонов,
+    # до 7 раундов каскада (новые id из ответов -> следующий раунд).
+    # Пул расширен: синонимы полей (account->{id}, user->{username}) и
+    # похожие значения (digits-выжимка, email local, uuid, соседи ±1)
     id_fuzz: bool = True
-    id_fuzz_max: int = 50
-    id_fuzz_templates_max: int = 10
-    id_fuzz_rounds: int = 5
+    id_fuzz_max: int = 60
+    id_fuzz_templates_max: int = 15
+    id_fuzz_rounds: int = 7
 
     # Интеграционные токены панелей (service_type+api_key): Bearer-проба
     # известных сервисов (clickadu balance, clickadilla profile, cloudflare)
