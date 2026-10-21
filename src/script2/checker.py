@@ -1008,6 +1008,55 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 except (json.JSONDecodeError, aiohttp.ClientError):
                     continue
 
+            # 2а. Общие структуры: ДО spec-None ветки (probe их использует),
+            # фазы 3/4 - после (данные из probe доживают до replay/login)
+            endpoints_data: list[dict[str, Any]] = []
+            all_patterns: list[str] = []
+            max_severity = "LOW"
+            severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
+            # AI-ключи, найденные в ответах (key -> provider), для верификации
+            ai_keys_found: dict[str, str] = {}
+            telegram_bots_found: set[str] = set()
+            aws_keypairs_found: dict[tuple[str, str, str], None] = {}
+            dsns_found: set[str] = set()
+            secrets_found: set[tuple[str, str]] = set()
+            twilio_pairs_found: set[tuple[str, str]] = set()
+            twitter_bearers_found: set[str] = set()
+            twitter_sessions_found: list[dict[str, Any]] = []
+            twitter_sessions_total: int = 0
+            exchange_pairs_found: list[dict[str, Any]] = []
+            exchange_pairs_seen: set[tuple[str, str, str]] = set()
+            cryptopay_keys_found: list[dict[str, Any]] = []
+            cryptopay_keys_seen: set[tuple] = set()
+            wp_pairs_found: list[dict[str, str]] = []
+            wp_panel_seen: bool = False
+            facebook_tokens_found: list[str] = []
+            facebook_tokens_seen: set[str] = set()
+            crypto_keys_found: list[dict[str, str]] = []
+            crypto_keys_seen: set[tuple[str, str]] = set()
+            integrations_found: list[dict[str, str]] = []
+            integration_entries_seen: set[str] = set()
+            integration_panel_seen: bool = False
+            # token replay: access_token'ы из тел + protected GET (401/403)
+            auth_tokens_found: list[str] = []
+            auth_tokens_seen: set[str] = set()
+            auth_token_sources: dict[str, str] = {}
+            protected_gets: list[tuple[str, str]] = []
+            token_replay_checks: list[dict[str, Any]] = []
+            # replay-входы фазы 3: cookie-сессии / креды / api-keys
+            replay_sessions: list[tuple[str, str]] = []
+            replay_sessions_seen: set[str] = set()
+            replay_creds: list[tuple[str, str]] = []
+            replay_creds_seen: set[tuple[str, str]] = set()
+            replay_apikeys: list[str] = []
+            replay_apikeys_seen: set[str] = set()
+            # login-эндпоинты (фаза 4: cred-проверка одной попыткой)
+            login_paths: list[str] = []
+            login_checks: list[dict[str, Any]] = []
+            # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
+            fuzz_buckets: dict[str, set[str]] = {}
+            param_templates_seen: set[str] = set()
+
             if spec is None:
                 result.has_openapi = False
                 # --- Generic probe: без спеки хост почти невидим - пробуем
@@ -1104,66 +1153,22 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         auth_token_sources.setdefault(tok, probe_path)
                     except (aiohttp.ClientError, asyncio.TimeoutError):
                         continue
-                # при живом сервере после probe - проваливаемся в фазы 3/4:
-                # защищённые пути и креды из probe попадают в общие списки
-                return result
+                # после probe НЕ выходим: spec={} -> спека-парсинг и
+                # endpoint-цикл ниже становятся no-op, а фазы 3/4 (replay/
+                # login) отрабатывают protected-пути и креды из probe
+                spec = {}
 
-            # 3. Парсим спецификацию
-            result.has_openapi = True
-            result.spec_path = spec_path
-            result.spec_title = spec.get("info", {}).get("title", "Unknown")
+            # 3. Парсим спецификацию (probe-хостам spec={} - блоки ниже no-op,
+            # has_openapi/spec_path/spec_title остаются от probe-ветки)
+            if spec:
+                result.has_openapi = True
+                result.spec_path = spec_path
+                result.spec_title = spec.get("info", {}).get("title", "Unknown")
 
             paths = spec.get("paths", {})
             security_schemes = spec.get("components", {}).get("securitySchemes", {})
             global_security = spec.get("security", [])
             has_global_security = bool(global_security) or bool(security_schemes)
-
-            endpoints_data: list[dict[str, Any]] = []
-            all_patterns: list[str] = []
-            max_severity = "LOW"
-            severity_order = {"LOW": 0, "MEDIUM": 1, "HIGH": 2, "CRITICAL": 3}
-            # AI-ключи, найденные в ответах (key -> provider), для верификации
-            ai_keys_found: dict[str, str] = {}
-            telegram_bots_found: set[str] = set()
-            aws_keypairs_found: dict[tuple[str, str, str], None] = {}
-            dsns_found: set[str] = set()
-            secrets_found: set[tuple[str, str]] = set()
-            twilio_pairs_found: set[tuple[str, str]] = set()
-            twitter_bearers_found: set[str] = set()
-            twitter_sessions_found: list[dict[str, Any]] = []
-            twitter_sessions_total: int = 0
-            exchange_pairs_found: list[dict[str, Any]] = []
-            exchange_pairs_seen: set[tuple[str, str, str]] = set()
-            cryptopay_keys_found: list[dict[str, Any]] = []
-            cryptopay_keys_seen: set[tuple] = set()
-            wp_pairs_found: list[dict[str, str]] = []
-            wp_panel_seen: bool = False
-            facebook_tokens_found: list[str] = []
-            facebook_tokens_seen: set[str] = set()
-            crypto_keys_found: list[dict[str, str]] = []
-            crypto_keys_seen: set[tuple[str, str]] = set()
-            integrations_found: list[dict[str, str]] = []
-            integration_entries_seen: set[str] = set()
-            integration_panel_seen: bool = False
-            # token replay: access_token'ы из тел + protected GET (401/403)
-            auth_tokens_found: list[str] = []
-            auth_tokens_seen: set[str] = set()
-            auth_token_sources: dict[str, str] = {}
-            protected_gets: list[tuple[str, str]] = []
-            token_replay_checks: list[dict[str, Any]] = []
-            # replay-входы фазы 3: cookie-сессии / креды / api-keys
-            replay_sessions: list[tuple[str, str]] = []
-            replay_sessions_seen: set[str] = set()
-            replay_creds: list[tuple[str, str]] = []
-            replay_creds_seen: set[tuple[str, str]] = set()
-            replay_apikeys: list[str] = []
-            replay_apikeys_seen: set[str] = set()
-            # login-эндпоинты (фаза 4: cred-проверка одной попыткой)
-            login_paths: list[str] = []
-            login_checks: list[dict[str, Any]] = []
-            # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
-            fuzz_buckets: dict[str, set[str]] = {}
-            param_templates_seen: set[str] = set()
 
             # 4. Тестируем эндпоинты
             for path_template, methods in paths.items():
