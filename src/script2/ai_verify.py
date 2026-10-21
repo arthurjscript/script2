@@ -1077,7 +1077,7 @@ async def probe_wp_admin(session: aiohttp.ClientSession, base_url: str,
             allow_redirects=True,
         ) as resp:
             if resp.status == 200:
-                text = await resp.text(content_type=None)
+                text = await resp.text()
                 if any(m in text.lower() for m in WP_LOGIN_MARKERS):
                     result["login"] = True
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
