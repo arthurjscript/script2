@@ -83,6 +83,16 @@ class Settings(BaseSettings):
     wp_checks: bool = True
     wp_verify_max: int = 10
 
+    # Facebook EAA-токены: graph /me (read-only) — живые аккаунты
+    facebook_checks: bool = True
+    facebook_verify_max: int = 3
+
+    # Приват-ключи (evm/solana/wif) → адрес → бесплатный on-chain баланс
+    # (publicnode ETH/BSC, blockstream BTC, mainnet-beta SOL). Баланс > 0
+    # = private_key_money
+    key_balance_checks: bool = True
+    key_balance_max: int = 3
+
     # id-fuzz: id'шники из тел подставляются в GET-шаблоны с {param}
     # (второй проход по тем же детекторам/экстракторам). Лимит на
     # идентичный GET-эндпоинт поднят: 50 id на шаблон, 10 шаблонов,

