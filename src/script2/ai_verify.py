@@ -492,7 +492,11 @@ AWS_BARE_SECRET_RE = re.compile(
     r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
 )
 AWS_SESSION_TOKEN_RE = re.compile(
-    r'[\'"]?(?:aws_)?(?:session|security)_token[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{20,})', re.I
+    r'[\'"]?(?:aws[_-]?)?(?:session|security)[_-]?token[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{20,})', re.I
+)
+# bare "Token" (IMDS) - только fallback, чтобы next_token/refresh_token не перебили
+AWS_TOKEN_FALLBACK_RE = re.compile(
+    r'[\'"]?token[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{20,})', re.I
 )
 
 
@@ -501,20 +505,21 @@ def extract_aws_keys(text: str) -> list[str]:
     return list(dict.fromkeys(AWS_KEY_RE.findall(text)))
 
 
-# Пары access_key + secret_key (JSON-поля, env-пары KEY=v, ini .aws/credentials key = v)
+# Пары access_key + secret_key (JSON, env KEY=v, ini key = v, camelCase AccessKeyId/
+# SecretAccessKey как в ответах IMDS /meta-data/iam/security-credentials)
 AWS_KEYPAIR_RE = re.compile(
-    r'[\'"]?(?:aws_access_key_id|access_key_id|aws_access_key)[\'"]?\s*[:=]\s*[\'"]?'
+    r'[\'"]?(?:aws[_-]?access[_-]?key[_-]?id|access[_-]?key[_-]?id|aws[_-]?access[_-]?key)[\'"]?\s*[:=]\s*[\'"]?'
     r'(A(?:K|S)IA[0-9A-Z]{16})(?![A-Za-z0-9/+=])[\'"]?'
     r'[^{}]{0,400}?'
-    r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+    r'[\'"]?(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|aws[_-]?secret[_-]?key|secret[_-]?key|aws[_-]?secret)[\'"]?'
     r'\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])[\'"]?',
     re.I,
 )
 AWS_KEYPAIR_RE_R = re.compile(
-    r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+    r'[\'"]?(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|aws[_-]?secret[_-]?key|secret[_-]?key|aws[_-]?secret)[\'"]?'
     r'\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])[\'"]?'
     r'[^{}]{0,400}?'
-    r'[\'"]?(?:aws_access_key_id|access_key_id|aws_access_key)[\'"]?'
+    r'[\'"]?(?:aws[_-]?access[_-]?key[_-]?id|access[_-]?key[_-]?id|aws[_-]?access[_-]?key)[\'"]?'
     r'\s*[:=]\s*[\'"]?(A(?:K|S)IA[0-9A-Z]{16})(?![A-Za-z0-9/+=])[\'"]?',
     re.I,
 )
@@ -529,8 +534,10 @@ def extract_aws_keypairs(text: str) -> list[tuple[str, str, str]]:
     40-char base64). Ложные кандидаты безопасны: STS вернёт invalid.
     """
     seen: dict[tuple[str, str], str] = {}
-    sess_tokens = AWS_SESSION_TOKEN_RE.findall(text)
-    token = sess_tokens[0] if sess_tokens else ""
+    m = AWS_SESSION_TOKEN_RE.search(text)
+    if not m:
+        m = AWS_TOKEN_FALLBACK_RE.search(text)
+    token = m.group(1) if m else ""
 
     for m in AWS_KEYPAIR_RE.finditer(text):
         seen.setdefault((m.group(1), m.group(2)), token)

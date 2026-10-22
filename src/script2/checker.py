@@ -252,10 +252,10 @@ SENSITIVE_PATTERNS = {
     # Форматы значения: JSON ("key": "v"), env (.env: KEY=v), ini (.aws/credentials: key = v)
     "aws_access_key": re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
     "aws_secret_key": re.compile(
-        r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+        r'[\'"]?(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|aws[_-]?secret[_-]?key|secret[_-]?key|aws[_-]?secret)[\'"]?'
         r'\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])', re.I),
     "aws_session_token": re.compile(
-        r'[\'"]?aws_(?:session|security)_token[\'"]?\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{20,}', re.I),
+        r'[\'"]?aws[_-]?(?:session|security)[_-]?token[\'"]?\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{20,}', re.I),
     # HIGH - Exchange
     "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # AI/SaaS API-ключи: уникальные префиксы провайдеров + generic api_key поля.
