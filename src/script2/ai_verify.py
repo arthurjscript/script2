@@ -480,6 +480,60 @@ async def verify_telegram_bot(
                 result["money"] = bool(money_cmds or money_desc)
             except (aiohttp.ClientError, TimeoutError):
                 pass
+
+            # Telegram Stars: баланс + транзакции за 30 дней (read-only Bot API);
+            # плюс webhook-info (url/pending) - webhook иногда выдаёт внутренний хост
+            try:
+                async with session.get(
+                    f"https://api.telegram.org/bot{token}/getMyStarBalance",
+                    proxy=proxy, timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            result["stars"] = int((data.get("result") or {}).get("amount") or 0)
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                pass
+            try:
+                async with session.get(
+                    f"https://api.telegram.org/bot{token}/getStarTransactions?limit=100",
+                    proxy=proxy, timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            txs = (data.get("result") or {}).get("transactions") or []
+                            now = datetime.now(timezone.utc).timestamp()
+                            month = [t for t in txs if now - int(t.get("date") or 0) <= 30 * 86400]
+                            result["stars_tx_30d"] = len(month)
+                            result["stars_30d"] = sum(int(t.get("amount") or 0) for t in month)
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                pass
+            try:
+                async with session.get(
+                    f"https://api.telegram.org/bot{token}/getWebhookInfo",
+                    proxy=proxy, timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("ok"):
+                            wi = data.get("result") or {}
+                            if wi.get("url"):
+                                result["webhook_url"] = str(wi["url"])[:200]
+                            result["pending_updates"] = int(wi.get("pending_update_count") or 0)
+            except (aiohttp.ClientError, TimeoutError, ValueError):
+                pass
+
+            # Сводка в detail - видна в таблице Verified на панели
+            extra = []
+            if result.get("stars") is not None:
+                extra.append(f"stars: {result['stars']}")
+            if result.get("stars_tx_30d") is not None:
+                extra.append(f"30д: {result.get('stars_30d', 0)} звёзд / {result['stars_tx_30d']} транз.")
+            if result.get("webhook_url"):
+                extra.append(f"webhook: {result['webhook_url']}")
+            if extra and not result.get("detail"):
+                result["detail"] = "; ".join(extra)
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
         result["detail"] = type(exc).__name__
     return result
