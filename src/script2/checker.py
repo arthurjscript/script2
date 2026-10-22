@@ -319,6 +319,12 @@ SENSITIVE_PATTERNS = {
     # user_login/application_password не ловим - поля мусорных доступов, шум.
     "wp_user": re.compile(r'"wp_user(?:name)?"\s*:\s*"[^"]{1,80}"', re.I),
     "wp_password": re.compile(r'"(?:wp_password|wp_pass)"\s*:\s*"[^"]{4,}"', re.I),
+    # wp-config.php (утёкший бэкап/дамп): define('DB_PASSWORD'|'AUTH_KEY'|соли, '...');
+    # AUTH_KEY/соли = подделка auth-cookie, DB_PASSWORD = mysql. JSON-семейство выше.
+    "wp_config": re.compile(
+        r'define\s*\(\s*[\'"](?:DB_PASSWORD|DB_USER|AUTH_KEY|SECURE_AUTH_KEY|LOGGED_IN_KEY|'
+        r'NONCE_KEY|AUTH_SALT|SECURE_AUTH_SALT|LOGGED_IN_SALT|NONCE_SALT)[\'"]\s*,\s*'
+        r'[\'"]([^\'"]{4,})[\'"]', re.I),
     # голый auth_key ловит чужие системы (RADIUS /health) - только WP-специфичные
     "wp_auth_key": re.compile(r'"(?:secure_auth_key|logged_in_key|nonce_key)"\s*:\s*"[^"]{16,}"', re.I),
     "wp_salt": re.compile(r'"(?:auth_salt|secure_auth_salt|logged_in_salt|nonce_salt)"\s*:\s*"[^"]{16,}"', re.I),
@@ -593,6 +599,14 @@ GENERIC_PROBE_PATHS = (
 # из них POST-формы - кандидат на фазу 4 (login-проверка с cred'ами)
 LOGIN_PROBE_PATHS = frozenset({"/login", "/api/login", "/admin/login", "/api/auth/login"})
 
+# Бэкапы wp-config.php (пробуются только на живом WP-хосте после wp_probe):
+# сам конфиг исполняется, расширения отдают исходник с DB_PASSWORD/AUTH_KEY
+WP_CONFIG_PROBE_PATHS = (
+    "/wp-config.php.bak", "/wp-config.php.old", "/wp-config.php.orig",
+    "/wp-config.php.save", "/wp-config.php~", "/wp-config.php.txt",
+    "/wp-config.bak", "/wp-config.txt",
+)
+
 
 # --- replay-входы (фаза 3): cookie-сессии, креды (пары + Basic), api-keys ---
 REPLAY_SESSION_RE = re.compile(
@@ -800,6 +814,7 @@ SEVERITY_MAP = {
     "admin_password": "CRITICAL",
     "wp_auth_key": "HIGH",
     "wp_salt": "HIGH",
+    "wp_config": "HIGH",
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
     # Активные пробы самого хоста как WP-админки
@@ -919,6 +934,14 @@ def classify_response(body: str) -> tuple[list[str], str]:
                         user, pwd = "", ""
                     if user.lower() in PLACEHOLDER_VALUES or pwd.lower() in PLACEHOLDER_VALUES or is_masked_value(pwd):
                         continue
+
+            # wp-config.php: скипаем дефолтные template-значения дистрибутива
+            if name == "wp_config":
+                m2 = re.search(r'[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]', value_text)
+                if m2 and (m2.group(1).lower() in ("password_here", "username_here", "put your unique phrase here")
+                           or is_masked_value(m2.group(1))
+                           or is_placeholder_value("password", m2.group(1))):
+                    continue
 
             # Для AWS ключей: не пример, не мусор, не presigned URL
             if name == "aws_access_key":
@@ -1990,6 +2013,38 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         max_severity = "HIGH"
                 if wp_probe.get("login") or wp_probe.get("users_enum"):
                     wp_checks.append(wp_probe)
+
+                # Догхантинг бэкапов wp-config.php: сам конфиг исполняется,
+                # а .bak/.old/... отдают исходник с DB_PASSWORD/AUTH_KEY/солями.
+                # Только на живом WP-хосте (wp_probe.login), GET-only.
+                for wp_path in WP_CONFIG_PROBE_PATHS:
+                    try:
+                        async with session.get(
+                            base_url.rstrip("/") + wp_path,
+                            headers={"User-Agent": "Mozilla/5.0 (compatible; scanner)"},
+                            allow_redirects=False, proxy=proxy,
+                            timeout=aiohttp.ClientTimeout(total=8.0),
+                        ) as wresp:
+                            if wresp.status != 200:
+                                continue
+                            wbody = await wresp.text()
+                            wpatterns, wsev = classify_response(wbody[:100_000])
+                            if "wp_config" not in wpatterns:
+                                continue
+                            wp_ep: dict[str, Any] = {
+                                "path": wp_path + "#probe", "method": "GET",
+                                "expects_auth": False, "status_code": wresp.status,
+                                "verdict": "VULNERABLE", "patterns": wpatterns,
+                                "response": wbody[:100_000],
+                            }
+                            endpoints_data.append(wp_ep)
+                            result.total_endpoints += 1
+                            result.vulnerable_count += 1
+                            all_patterns.extend(wpatterns)
+                            if severity_order.get(wsev, 0) > severity_order.get(max_severity, 0):
+                                max_severity = wsev
+                    except (aiohttp.ClientError, asyncio.TimeoutError):
+                        continue
 
             # Facebook EAA-токены: GET graph /me (read-only) = живые аккаунты
             facebook_checks: list[dict[str, Any]] = []
