@@ -266,6 +266,9 @@ SENSITIVE_PATTERNS = {
         r'\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])', re.I),
     "aws_session_token": re.compile(
         r'[\'"]?aws[_-]?(?:session|security)[_-]?token[\'"]?\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{20,}', re.I),
+    # Одинокий AWS Access Key ID без секрета рядом - не кред (это "логин"):
+    # LOW, чтобы не поднимал severity. Пара с секретом ловится aws_access_key.
+    "aws_key_id": re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
     # HIGH - Exchange
     "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # AI/SaaS API-ключи: уникальные префиксы провайдеров + generic api_key поля.
@@ -432,6 +435,26 @@ def is_aws_example_key(key: str) -> bool:
         return True
     # Низкая энтропия: AKIAAAAUAAAAAAAAAAAA (base64-блобы, заполнители)
     return len(set(key[4:])) < 4
+
+
+# bare 40-char base64 - кандидат в AWS secret (как AWS_BARE_SECRET_RE в ai_verify)
+AWS_BARE40_RE = re.compile(r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])')
+
+
+def aws_secret_nearby(body: str, pos: int, window: int = 160) -> bool:
+    """Evidence секрета AWS рядом с access key ID (имя поля или 40-char base64).
+
+    Окно совпадает с fallback-поиском пары в ai_verify.extract_aws_keypairs.
+    """
+    seg = body[max(0, pos - window):pos + window]
+    if re.search(
+            r'[\'"]?(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key'
+            r'|aws[_-]?secret[_-]?key|secret[_-]?key|aws[_-]?secret)[\'"]?', seg, re.I):
+        return True
+    for m40 in AWS_BARE40_RE.finditer(seg):
+        if not m40.group(0).startswith(("AKIA", "ASIA")):
+            return True
+    return False
 
 
 def is_placeholder_dsn(dsn: str) -> bool:
@@ -765,6 +788,7 @@ SEVERITY_MAP = {
     "bearer_token": "HIGH",
     "jwt_token": "HIGH",
     "aws_access_key": "HIGH",
+    "aws_key_id": "LOW",
     "aws_secret_key": "HIGH",
     "aws_session_token": "HIGH",
     "binance_key": "HIGH",
@@ -991,6 +1015,21 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 # это не утечка кредов
                 before = body[max(0, m.start() - 30):m.start()]
                 if "X-Amz-Credential=" in before or "AWSAccessKeyId=" in before:
+                    continue
+                # голый ID без секрета рядом - не кред ("логин" без пароля),
+                # уходит в aws_key_id (LOW)
+                if not aws_secret_nearby(body, m.start()):
+                    continue
+
+            # aws_key_id - зеркальный гард: пара с секретом уже записана
+            # как aws_access_key (HIGH)
+            if name == "aws_key_id":
+                if is_aws_example_key(value_text):
+                    continue
+                before = body[max(0, m.start() - 30):m.start()]
+                if "X-Amz-Credential=" in before or "AWSAccessKeyId=" in before:
+                    continue
+                if aws_secret_nearby(body, m.start()):
                     continue
 
             # Для DSN проверяем что не placeholder
