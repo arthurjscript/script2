@@ -180,12 +180,22 @@ SENSITIVE_PATTERNS = {
         r'|<(?:password|passwd|pwd|admin[_-]?password|user[_-]?password|smtp[_-]?pass)'
         r'[^>]{0,24}>(?:<!\[CDATA\[)?([^<\s\n][^<\n]{2,120})(?:\]\]>)?</'),
     "api_key_any": re.compile(
-        r'(?mi)^[ \t]*[A-Z0-9_]{0,24}(?:API_?KEY|APIKEY|SECRET_?KEY|ACCESS_?KEY)[A-Z0-9_]{0,16}='
+        r'(?mi)^[ \t]*(?:export[ \t]+)?[A-Z0-9_]{0,24}(?:API_?KEY|APIKEY|SECRET_?KEY|ACCESS_?KEY|API_?SECRET)[A-Z0-9_]{0,16}='
         r'(?:["\'][^\'"\n]{6,120}["\']|[^#\s\n][^#\n]{5,119})[ \t]*(?:#|$)'
-        r'|^[ \t]*[a-z0-9_]{0,24}(?:api_?key|apikey|secret_?key)[a-z0-9_]{0,16}[ \t]*:[ \t]*'
-        r'(?:["\'][^\'\n]{6,120}["\']|[^#\s\n][^#\n]{5,119})[ \t]*(?:#|$)'
+        r'|^[ \t]*[a-z0-9_]{0,24}(?:api_?key|apikey|secret_?key|api_?secret)[a-z0-9_]{0,16}[ \t]*:[ \t]*'
+        r'(?:["\'][^\'"\n]{6,120}["\']|[^#\s\n][^#\n]{5,119})[ \t]*(?:#|$)'
         r'|<(?:api_?key|apikey|secret[_-]?key)[^>]{0,24}>'
         r'(?:<!\[CDATA\[)?([^<\s\n][^<\n]{5,120})(?:\]\]>)?</'),
+    # Остаточные токены (access/refresh/auth/session/bot/reset/api_token)
+    # в env/yaml/XML - JSON-семейство выше, а env ACCESS_TOKEN=/REFRESH_TOKEN=
+    # в password_any (PASSWORD-семейство) и api_key_any (KEY-семейство) не попадали
+    "token_any": re.compile(
+        r'(?mi)^[ \t]*(?:export[ \t]+)?[A-Z0-9_]{0,24}TOKEN[A-Z0-9_]{0,8}='
+        r'(?:["\'][^\'"\n]{16,250}["\']|[^#\s\n][^#\n]{15,249})[ \t]*(?:#|$)'
+        r'|^[ \t]*[a-z0-9_]{0,24}(?:access|refresh|auth|bearer|session|reset|api|bot)[a-z0-9_]{0,8}token[a-z0-9_]{0,16}[ \t]*:[ \t]*'
+        r'(?:["\'][^\'"\n]{16,250}["\']|[^#\s\n][^#\n]{15,249})[ \t]*(?:#|$)'
+        r'|<(?:access|refresh|auth|session|reset|api|bot)[_-]?token[^>]{0,24}>'
+        r'(?:<!\[CDATA\[)?([^<\s\n][^<\n]{15,249})(?:\]\]>)?</'),
     # EVM/Tron private key: 64 hex (0x или без) в поле приватного ключа.
     # Широкий охват имён: private_key, PRIVATE_KEY, privateKey, evm_private_key,
     # walletPrivateKey, tron_private_key, owner_key, signer_key, deployer_key,
@@ -815,6 +825,7 @@ SEVERITY_MAP = {
     "wp_auth_key": "HIGH",
     "wp_salt": "HIGH",
     "wp_config": "HIGH",
+    "token_any": "HIGH",
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
     # Активные пробы самого хоста как WP-админки
@@ -901,6 +912,28 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 # "password: form.get(...)", "new_password: form.get(...)," —
                 # это JS-код, а не конфиг. Признак: скобки в значении
                 # или trailing-запятая (end of JS-объектного свойства)
+                if ":" in value_text:
+                    tail = value_text.split(":", 1)[1]
+                    if "(" in tail or "=>" in tail or tail.rstrip().endswith(",") \
+                            or ".value" in tail \
+                            or tail.lstrip().startswith(("document", "form", "window", "$(", "e", "this", "req")):
+                        continue
+
+            # token_any (env/yaml/XML): те же гарды, что у JSON-токенов +
+            # YAML-пустышки и JS-код в значении
+            if name == "token_any":
+                m2 = re.search(r'(?:=|:|>)[ \t]*(?:<!\[CDATA\[)?["\']?([^"\'<\n#]{16,250})', value_text)
+                a_val = (m2.group(1).strip() if m2 else "").rstrip("'\"")
+                if not a_val or len(a_val) < 16:
+                    continue
+                if a_val.lower() in ("null", "none", "true", "false", "nil", "~", "changeme"):
+                    continue
+                if UUID_VALUE_RE.match(a_val) or is_junk_token_value(a_val) \
+                        or is_masked_value(a_val) or is_placeholder_value("token", a_val):
+                    continue
+                if HASHED_PASSWORD_RE.match(a_val) or HEX_HASH_RE.match(a_val) or ENCODED_BLOB_RE.match(a_val):
+                    continue
+                # yaml-ветка: "token: form.get(...)" - JS-код, не конфиг
                 if ":" in value_text:
                     tail = value_text.split(":", 1)[1]
                     if "(" in tail or "=>" in tail or tail.rstrip().endswith(",") \
