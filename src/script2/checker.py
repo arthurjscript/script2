@@ -248,11 +248,14 @@ SENSITIVE_PATTERNS = {
     "auth_token": re.compile(r'"auth_token"\s*:\s*"[^"]{16,}"', re.I),
     "bearer_token": re.compile(r'"bearer"\s*:\s*"[^"]{16,}"', re.I),
     "jwt_token": re.compile(r'"jwt"\s*:\s*"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"'),
-    # HIGH - AWS. ASIA = временные STS-креды (без session_token не верифицируются)
+    # HIGH - AWS. ASIA = временные STS-креды (без session_token не верифицируются).
+    # Форматы значения: JSON ("key": "v"), env (.env: KEY=v), ini (.aws/credentials: key = v)
     "aws_access_key": re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
     "aws_secret_key": re.compile(
-        r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"[A-Za-z0-9/+=]{40}"', re.I),
-    "aws_session_token": re.compile(r'"aws_session_token"\s*:\s*"[A-Za-z0-9/+=]{20,}"', re.I),
+        r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+        r'\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])', re.I),
+    "aws_session_token": re.compile(
+        r'[\'"]?aws_(?:session|security)_token[\'"]?\s*[:=]\s*[\'"]?[A-Za-z0-9/+=]{20,}', re.I),
     # HIGH - Exchange
     "binance_key": re.compile(r'"(?:api_key|apiKey)"\s*:\s*"[A-Za-z0-9]{64}"'),
     # AI/SaaS API-ключи: уникальные префиксы провайдеров + generic api_key поля.

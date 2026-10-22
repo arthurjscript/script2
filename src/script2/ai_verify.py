@@ -492,7 +492,7 @@ AWS_BARE_SECRET_RE = re.compile(
     r'(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])'
 )
 AWS_SESSION_TOKEN_RE = re.compile(
-    r'"(?:aws_)?session_token"\s*:\s*"([A-Za-z0-9/+=]{20,})"', re.I
+    r'[\'"]?(?:aws_)?(?:session|security)_token[\'"]?\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{20,})', re.I
 )
 
 
@@ -501,17 +501,21 @@ def extract_aws_keys(text: str) -> list[str]:
     return list(dict.fromkeys(AWS_KEY_RE.findall(text)))
 
 
-# Пары access_key + secret_key в одном JSON-объекте (оба порядка полей)
+# Пары access_key + secret_key (JSON-поля, env-пары KEY=v, ini .aws/credentials key = v)
 AWS_KEYPAIR_RE = re.compile(
-    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(A(?:K|S)IA[0-9A-Z]{16})"'
+    r'[\'"]?(?:aws_access_key_id|access_key_id|aws_access_key)[\'"]?\s*[:=]\s*[\'"]?'
+    r'(A(?:K|S)IA[0-9A-Z]{16})(?![A-Za-z0-9/+=])[\'"]?'
     r'[^{}]{0,400}?'
-    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"([A-Za-z0-9/+=]{40})"',
+    r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+    r'\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])[\'"]?',
     re.I,
 )
 AWS_KEYPAIR_RE_R = re.compile(
-    r'"(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)"\s*:\s*"([A-Za-z0-9/+=]{40})"'
+    r'[\'"]?(?:aws_secret_access_key|secret_access_key|aws_secret_key|secret_key|aws_secret)[\'"]?'
+    r'\s*[:=]\s*[\'"]?([A-Za-z0-9/+=]{40})(?![A-Za-z0-9/+=])[\'"]?'
     r'[^{}]{0,400}?'
-    r'"(?:aws_access_key_id|access_key_id|aws_access_key)"\s*:\s*"(A(?:K|S)IA[0-9A-Z]{16})"',
+    r'[\'"]?(?:aws_access_key_id|access_key_id|aws_access_key)[\'"]?'
+    r'\s*[:=]\s*[\'"]?(A(?:K|S)IA[0-9A-Z]{16})(?![A-Za-z0-9/+=])[\'"]?',
     re.I,
 )
 
@@ -519,7 +523,8 @@ AWS_KEYPAIR_RE_R = re.compile(
 def extract_aws_keypairs(text: str) -> list[tuple[str, str, str]]:
     """Пары (access_key, secret_key, session_token) из одного тела.
 
-    Сначала JSON-пары (оба порядка полей), затем fallback: bare access key
+    JSON-пары (оба порядка полей), env-пары KEY=v и ini (aws_access_key_id = ...).
+    Затем fallback: bare access key
     без пары - кандидат в секрет ищем рядом (окно ±160 символов, ровно
     40-char base64). Ложные кандидаты безопасны: STS вернёт invalid.
     """
