@@ -975,6 +975,14 @@ def classify_response(body: str) -> tuple[list[str], str]:
                            or is_placeholder_value("password", m2.group(1))):
                     continue
 
+            # google_api_key в браузерном загрузчике Google Maps
+            # (maps/api/js?key=...) - публичный embed-ключ, не утечка;
+            # серверные вызовы (.../directions/json?key=) остаёмся - там реальный кред
+            if name == "google_api_key":
+                before = body[max(0, m.start() - 60):m.start()].lower()
+                if "maps/api/js?key=" in before:
+                    continue
+
             # Для AWS ключей: не пример, не мусор, не presigned URL
             if name == "aws_access_key":
                 if is_aws_example_key(value_text):
@@ -1114,6 +1122,9 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
             # id-fuzz: id'шники из тел + GET-шаблоны с {param} для фазы 2
             fuzz_buckets: dict[str, set[str]] = {}
             param_templates_seen: set[str] = set()
+            # probe: одинаковые тела не дублируем (SPA отдаёт один index.html
+            # на все пути - иначе 16 одинаковых "vulnerable")
+            probe_bodies_seen: set[str] = set()
 
             if spec is None:
                 result.has_openapi = False
@@ -1134,11 +1145,21 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             proxy=proxy,
                         ) as rresp:
                             pbody = await rresp.text()
-                            ppatterns, psev = classify_response(pbody[:100_000])
                             # защищённый GET - в очередь replay (401/403)
                             if rresp.status in (401, 403):
                                 if len(protected_gets) < cfg.token_replay_endpoints_max:
                                     protected_gets.append((probe_path, probe_path))
+                            # 404/5xx страницы - не находки: SPA-404 с
+                            # google_api_key/password в HTML-шаблоне штамповал
+                            # 16 одинаковых "vulnerable" (ложные срабатывания)
+                            if not (200 <= rresp.status < 300):
+                                continue
+                            # одно и то же тело на разных путях - один наход
+                            body_sig = pbody[:1000]
+                            if body_sig in probe_bodies_seen:
+                                continue
+                            probe_bodies_seen.add(body_sig)
+                            ppatterns, psev = classify_response(pbody[:100_000])
                             if not ppatterns:
                                 continue
                             # фиды: сессии/креды/api-keys/facebook/crypto/wp
