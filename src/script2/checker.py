@@ -829,7 +829,6 @@ SEVERITY_MAP = {
     "wp_password": "CRITICAL",
     "wp_creds_valid": "CRITICAL",
     # Активные пробы самого хоста как WP-админки
-    "wp_login_found": "MEDIUM",
     "wp_users_enum": "HIGH",
     "integration_valid": "CRITICAL",
     "token_replay": "CRITICAL",
@@ -2031,20 +2030,17 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         if len(wp_checks) >= cfg.wp_verify_max:
                             break
 
-            # Активная проба самого хоста как WordPress-админки: не только
-            # утечки wp_user в чужих панелях, но и живые wp-login.php /
-            # REST-перечисление пользователей. Read-only GET, короткий таймаут.
+            # Активная проба самого хоста как WordPress-админки. wp_login_found
+            # больше не пишем - сам факт логин-формы это шум, нужны креды
+            # (wp_creds_valid/wp_password/wp_config). login остаётся триггером
+            # догхантинга wp-config-бэкапов ниже. Read-only GET.
             if cfg.wp_checks:
                 wp_probe = await probe_wp_admin(session, base_url, proxy=proxy)
-                if wp_probe.get("login"):
-                    all_patterns.append("wp_login_found")
-                    if severity_order.get(max_severity, 0) < 1:
-                        max_severity = "MEDIUM"
                 if wp_probe.get("users_enum"):
                     all_patterns.append("wp_users_enum")
                     if severity_order.get(max_severity, 0) < 2:
                         max_severity = "HIGH"
-                if wp_probe.get("login") or wp_probe.get("users_enum"):
+                if wp_probe.get("users_enum"):
                     wp_checks.append(wp_probe)
 
                 # Догхантинг бэкапов wp-config.php: сам конфиг исполняется,
