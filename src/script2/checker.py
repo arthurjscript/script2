@@ -314,6 +314,14 @@ SENSITIVE_PATTERNS = {
     "pypi_token": re.compile(r'pypi-[A-Za-z0-9_-]{80,}'),
     "shopify_key": re.compile(r'shpat_[a-fA-F0-9]{32}'),
     "dropbox_token": re.compile(r'sl\.[A-Za-z0-9_-]{130,}'),
+    # Supabase: legacy JWT-ключи (payload {"iss":"supabase","ref":...}) и новые
+    # sb_secret_ (sb_publishable_ публичные - не ловим). Роль anon публична по
+    # дизайну (MEDIUM), service_role обходит RLS - разделение при верификации
+    "supabase_key": re.compile(
+        r'\beyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZSI[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+'
+        r'|\bsb_secret_[A-Za-z0-9]{30,60}\b'),
+    # Firecrawl: scraping-сервис с платными кредитами
+    "firecrawl_key": re.compile(r'\bfc-[A-Za-z0-9]{32}\b'),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
@@ -835,6 +843,13 @@ SEVERITY_MAP = {
     "pypi_token": "HIGH",
     "shopify_key": "HIGH",
     "dropbox_token": "HIGH",
+    # Supabase: anon-ключ публичен по дизайну, service_role = обход RLS (HIGH
+    # после верификации); firecrawl = платный scraping-доступ
+    "supabase_key": "MEDIUM",
+    "supabase_service_valid": "HIGH",
+    "supabase_key_valid": "LOW",
+    "firecrawl_key": "HIGH",
+    "firecrawl_key_valid": "HIGH",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
@@ -1992,9 +2007,14 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                     )
                     secret_checks.append(chk)
                     if chk["status"] == "valid":
-                        all_patterns.append(f"{kind}_key_valid"
-                                             if kind in ("stripe", "mailgun", "sendgrid")
-                                             else f"{kind}_token_valid")
+                        if kind == "supabase" and chk.get("role") in ("service_role", "secret"):
+                            # service_role обходит RLS - полный доступ к БД
+                            all_patterns.append("supabase_service_valid")
+                        else:
+                            all_patterns.append(f"{kind}_key_valid"
+                                                 if kind in ("stripe", "mailgun", "sendgrid",
+                                                             "firecrawl", "supabase")
+                                                 else f"{kind}_token_valid")
                         sev = SEVERITY_MAP.get(all_patterns[-1], "HIGH")
                         if severity_order.get(sev, 0) > severity_order.get(max_severity, 0):
                             max_severity = sev

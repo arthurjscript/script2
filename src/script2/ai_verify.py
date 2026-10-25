@@ -830,6 +830,11 @@ SECRET_EXTRACTORS: list[tuple[str, re.Pattern[str]]] = [
     ("sendgrid", re.compile(r'\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b')),
     ("npm", re.compile(r'\bnpm_[A-Za-z0-9]{36}\b')),
     ("dropbox", re.compile(r'\bsl\.[A-Za-z0-9_-]{130,}\b')),
+    # Supabase: legacy JWT (payload {"iss":"supabase",...}) + новые sb_secret_
+    ("supabase", re.compile(
+        r'\beyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJpc3MiOiJzdXBhYmFzZSI[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+'
+        r'|\bsb_secret_[A-Za-z0-9]{30,60}\b')),
+    ("firecrawl", re.compile(r'\bfc-[A-Za-z0-9]{32}\b')),
 ]
 
 
@@ -1000,6 +1005,75 @@ async def verify_secret(
                     result["detail"] = "HTTP 401"
                 else:
                     result["detail"] = f"HTTP {resp.status}"
+        elif kind == "supabase":
+            # legacy JWT: роль/ref из payload (service_role обходит RLS);
+            # sb_secret_ - новый формат без ref (проект по значению не восстановить)
+            role, ref = "", ""
+            if value.startswith("sb_"):
+                role = "secret"
+            else:
+                try:
+                    payload = value.split(".")[1]
+                    payload += "=" * (-len(payload) % 4)
+                    claims = json.loads(base64.urlsafe_b64decode(payload))
+                    role = str(claims.get("role", ""))
+                    ref = str(claims.get("ref", ""))
+                except Exception:
+                    pass
+            if not ref:
+                result["detail"] = "no project ref"
+                return result
+            result["role"] = role
+            result["ref"] = ref
+            async with session.get(
+                f"https://{ref}.supabase.co/rest/v1/",
+                headers={"apikey": value, "Authorization": f"Bearer {value}"},
+                proxy=proxy, timeout=timeout,
+            ) as resp:
+                if resp.status == 200:
+                    result["status"] = "valid"
+                    result["detail"] = f"role={role} ref={ref}"
+                    if role in ("service_role", "secret"):
+                        result["detail"] += " (bypass RLS, full DB)"
+                elif resp.status in (401, 403):
+                    result["status"] = "invalid"
+                    result["detail"] = f"HTTP {resp.status}"
+                else:
+                    result["detail"] = f"HTTP {resp.status}"
+        elif kind == "firecrawl":
+            # кредиты команды: read-only, показывает остаток платных кредитов
+            for url in ("https://api.firecrawl.dev/v2/team/credit-usage",
+                        "https://api.firecrawl.dev/v1/team/credit-usage"):
+                async with session.get(
+                    url,
+                    headers={"Authorization": f"Bearer {value}"},
+                    proxy=proxy, timeout=timeout,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        d = data.get("data") or data or {}
+                        # v2: remainingCredits/planCredits; v1: creditsUsed/plan
+                        rem = d.get("remainingCredits")
+                        total = d.get("planCredits")
+                        used = d.get("creditsUsed")
+                        plan = d.get("planId") or d.get("plan") or ""
+                        bits = []
+                        if rem is not None:
+                            bits.append(f"credits_left={rem}" + (f"/{total}" if total else ""))
+                        elif used is not None:
+                            bits.append(f"credits_used={used}")
+                        if plan:
+                            bits.append(f"plan={plan}")
+                        result["status"] = "valid"
+                        result["detail"] = " ".join(bits) or "ok"
+                        break
+                    if resp.status in (401, 403):
+                        result["status"] = "invalid"
+                        result["detail"] = f"HTTP {resp.status}"
+                        break
+                    if resp.status not in (404, 405):
+                        result["detail"] = f"HTTP {resp.status}"
+                        break
         else:
             result["detail"] = f"unknown kind {kind}"
     except (aiohttp.ClientError, TimeoutError, OSError) as exc:
