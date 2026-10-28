@@ -1035,6 +1035,8 @@ async def verify_secret(
                     result["detail"] = f"role={role} ref={ref}"
                     if role in ("service_role", "secret"):
                         result["detail"] += " (bypass RLS, full DB)"
+                    elif role == "anon":
+                        result["detail"] += " (public by design, client-side key)"
                 elif resp.status in (401, 403):
                     result["status"] = "invalid"
                     result["detail"] = f"HTTP {resp.status}"

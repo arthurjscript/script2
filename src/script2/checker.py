@@ -532,6 +532,34 @@ UUID_VALUE_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
 # Подстановки окружения: "${REDIS_PASSWORD}", "$DB_PASS", "{{secret_key}}" —
 # в ответе лежит шаблон, а не значение
 INTERPOLATED_RE = re.compile(r'^(?:\$\{[^}]{1,128}\}|\$[A-Za-z_][A-Za-z0-9_]{0,127}|\{\{[^}]{1,128}\}\})$')
+
+# JWT placeholder issuers/subjects (публичные или тестовые токены)
+JWT_PLACEHOLDER_ISS = {
+    "test", "demo", "example", "localhost", "127.0.0.1", "example.com",
+    "your-issuer", "issuer", "auth0", "cognito", "keycloak", "okta",
+}
+JWT_PLACEHOLDER_SUB = {
+    "test", "demo", "example", "user", "admin", "guest", "anonymous",
+    "test@example.com", "user@example.com", "1234567890", "sub",
+}
+
+# Health/monitoring paths для basic_auth (внутренние сервисы, не утечка)
+HEALTH_MONITORING_PATHS_RE = re.compile(
+    r'(?:^|/)(?:health|ping|status|ready|live|metrics|prometheus|grafana|actuator|monitor)',
+    re.I,
+)
+# Health/monitoring users в basic_auth (prometheus, grafana, monitoring)
+HEALTH_MONITORING_USERS = {
+    "prometheus", "grafana", "monitoring", "health", "healthcheck",
+    "actuator", "metrics", "admin", "monitor", "ping",
+}
+
+# Guest/anonymous контекст для session tokens (новая сессия, не утечка)
+GUEST_ANONYMOUS_RE = re.compile(
+    r'"(?:is_guest|is_anonymous|guest|anonymous|visitor)"\s*:\s*(?:true|1)\b'
+    r'|"(?:user_?type|account_?type|role)"\s*:\s*"(?:guest|anonymous|visitor)"',
+    re.I,
+)
 # id-fuzz: пары "поле": значение из тел. Собираются значения полей,
 # чьи имена похожи на подстановочные параметры (id/slug/username/email/...)
 FUZZ_PAIR_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]{0,64})"\s*:\s*"?([^",\[\]{}]{1,120})"?', re.I)
@@ -732,6 +760,45 @@ def is_junk_token_value(val: str) -> bool:
         return True
     if not any(c.isdigit() for c in v):
         return True
+    return False
+
+
+def is_placeholder_jwt(token: str) -> bool:
+    """Проверяет что JWT - placeholder/тестовый/истёкший.
+
+    Декодирует payload (без верификации подписи) и проверяет:
+    - exp в прошлом (токен истёк)
+    - iss/sub = placeholder значения
+    """
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        payload_b64 = parts[1]
+        # Добавляем padding для base64
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(payload_b64))
+        if not isinstance(payload, dict):
+            return False
+        # exp в прошлом - токен истёк, бесполезен
+        exp = payload.get("exp")
+        if exp is not None:
+            try:
+                if int(exp) < time.time():
+                    return True
+            except (ValueError, TypeError):
+                pass
+        # placeholder issuer/subject
+        iss = str(payload.get("iss", "")).lower().strip()
+        sub = str(payload.get("sub", "")).lower().strip()
+        if iss in JWT_PLACEHOLDER_ISS or sub in JWT_PLACEHOLDER_SUB:
+            return True
+        # Типичные тестовые значения
+        if iss.startswith(("test", "demo", "example", "localhost")) \
+                or sub.startswith(("test", "demo", "example")):
+            return True
+    except (ValueError, TypeError, json.JSONDecodeError, UnicodeDecodeError):
+        pass
     return False
 
 
@@ -989,6 +1056,15 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 # (сервер выдал новую сессию для запроса), не утечка
                 if tok_match and name in ("session_id", "session_token") and UUID_VALUE_RE.match(tok_match.group(1)):
                     continue
+                # Guest/anonymous контекст в том же ответе - сессия гостя, не утечка
+                if name in ("session_id", "session_token") and GUEST_ANONYMOUS_RE.search(body[:10_000]):
+                    continue
+
+            # jwt_token: пропускаем истёкшие и placeholder токены
+            if name == "jwt_token":
+                jwt_match = re.search(r'"jwt"\s*:\s*"(eyJ[^"]+)"', value_text)
+                if jwt_match and is_placeholder_jwt(jwt_match.group(1)):
+                    continue
 
             # credential: пропускаем не-секретные значения (дипломы, описания)
             if name == "credential":
@@ -996,7 +1072,8 @@ def classify_response(body: str) -> tuple[list[str], str]:
                 if cred_match and not any(c.isdigit() for c in cred_match.group(1)):
                     continue
 
-            # basic_auth: пропускаем примеры user:pass из документации
+            # basic_auth: пропускаем примеры user:pass из документации и
+            # health/monitoring сервисы (prometheus, grafana, actuator)
             if name == "basic_auth":
                 b64_match = re.search(r'Basic\s+([A-Za-z0-9+/=]+)', value_text, re.I)
                 if b64_match:
@@ -1005,6 +1082,9 @@ def classify_response(body: str) -> tuple[list[str], str]:
                     except (ValueError, UnicodeDecodeError):
                         user, pwd = "", ""
                     if user.lower() in PLACEHOLDER_VALUES or pwd.lower() in PLACEHOLDER_VALUES or is_masked_value(pwd):
+                        continue
+                    # health/monitoring users - внутренние сервисы, не утечка
+                    if user.lower() in HEALTH_MONITORING_USERS:
                         continue
 
             # wp-config.php: скипаем дефолтные template-значения дистрибутива
@@ -1400,8 +1480,19 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
 
                                 # is_admin: голый флаг в списках профилей - не находка.
                                 # Находим факт входа: /admin/* без auth или токен рядом.
+                                # Demo/guest пути: is_admin демо-аккаунта - не утечка.
                                 if "admin_flag" in patterns:
-                                    if ADMIN_PATH_RE.search(path_template) and "admin_area" not in patterns:
+                                    if DEMO_GUEST_PATH_RE.search(path_template):
+                                        # demo/guest эндпоинт - is_admin не считаем
+                                        patterns.remove("admin_flag")
+                                        if patterns:
+                                            sev = max(
+                                                (SEVERITY_MAP.get(p, "LOW") for p in patterns),
+                                                key=severity_order.get,
+                                            )
+                                        else:
+                                            sev = "LOW"
+                                    elif ADMIN_PATH_RE.search(path_template) and "admin_area" not in patterns:
                                         patterns.append("admin_area")
                                         if severity_order["CRITICAL"] > severity_order.get(sev, 0):
                                             sev = "CRITICAL"
@@ -1666,8 +1757,13 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                                         if not fpatterns:
                                             continue
                                         # admin_flag: как в основном проходе
+                                        # Demo/guest пути: is_admin демо-аккаунта - не утечка
                                         if "admin_flag" in fpatterns:
-                                            if ADMIN_PATH_RE.search(tmpl) and \
+                                            if DEMO_GUEST_PATH_RE.search(tmpl):
+                                                fpatterns.remove("admin_flag")
+                                                if not fpatterns:
+                                                    continue
+                                            elif ADMIN_PATH_RE.search(tmpl) and \
                                                     "admin_area" not in fpatterns:
                                                 fpatterns.append("admin_area")
                                             else:
