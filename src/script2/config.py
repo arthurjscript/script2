@@ -139,6 +139,10 @@ class Settings(BaseSettings):
     proxy_file: str = ""
     proxy_url: str = ""
 
+    # Игнор по телу: маркеры декоев (подстрока -> хост ignored, не попадает в checked_hosts)
+    ignore_body_markers: str = ""  # inline: маркеры через запятую
+    ignore_body_file: str = ""  # путь к файлу: один маркер на строку
+
     # Health
     heartbeat_file: str = "/tmp/heartbeat"
     log_level: str = "INFO"

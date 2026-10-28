@@ -24,12 +24,14 @@ class Worker:
         cfg: Settings,
         stop: asyncio.Event,
         proxies: list[str] | None = None,
+        markers: list[str] | None = None,
     ) -> None:
         self.repo = repo
         self.cfg = cfg
         self.stop = stop
         self.proxies = proxies or []
         self.proxy_cycle = itertools.cycle(self.proxies) if self.proxies else None
+        self.markers = markers or []
 
         # Счётчики
         self.claimed = 0
@@ -39,6 +41,7 @@ class Worker:
         self.failed_count = 0
         self.save_failed = 0
         self.lost_lease = 0
+        self.ignored_count = 0
 
     def get_proxy(self) -> str | None:
         """Возвращает следующий прокси из ротации."""
@@ -60,13 +63,29 @@ class Worker:
 
         try:
             result = await asyncio.wait_for(
-                check_host(row, self.cfg, proxy=proxy),
+                check_host(row, self.cfg, proxy=proxy, markers=self.markers),
                 timeout=self.cfg.host_timeout,
             )
         except Exception as exc:
             log.warning("Check failed id=%d error=%s", row.id, repr(exc))
             await self.repo.mark_retry(row.id, repr(exc))
             self.retry_count += 1
+            return
+
+        # Игнорируемый хост (декой по маркеру в теле): done + last_error, в checked_hosts НЕ пишем
+        if result.data.get("ignored"):
+            marker = result.data.get("ignored_marker") or "?"
+            try:
+                marked = await self.repo.mark_ignored(row.id, marker)
+                if not marked:
+                    log.warning("Lost lease (ignored) id=%d", row.id)
+                    self.lost_lease += 1
+                    return
+            except Exception as exc:
+                log.warning("mark_ignored failed id=%d error=%s", row.id, repr(exc))
+                return
+            self.ignored_count += 1
+            log.info("IGNORED_BODY id=%d ip=%s:%d marker=%s", row.id, row.host, row.port, marker)
             return
 
         try:
@@ -322,7 +341,7 @@ class Worker:
             # Выводим статистику раз в 60 секунд
             if time.time() - last_stats >= 60:
                 log.info(
-                    "Stats: claimed=%d alive=%d dead=%d retry=%d failed=%d lost=%d save_failed=%d inflight=%d",
+                    "Stats: claimed=%d alive=%d dead=%d retry=%d failed=%d lost=%d save_failed=%d ignored=%d inflight=%d",
                     self.claimed,
                     self.done_alive,
                     self.done_dead,
@@ -330,6 +349,7 @@ class Worker:
                     self.failed_count,
                     self.lost_lease,
                     self.save_failed,
+                    self.ignored_count,
                     len(inflight),
                 )
                 last_stats = time.time()

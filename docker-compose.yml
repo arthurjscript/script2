@@ -10,6 +10,8 @@ services:
     restart: "no"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    networks:
+      - scanner-network
 
   script2:
     build: .
@@ -26,6 +28,7 @@ services:
     stop_grace_period: 45s
     volumes:
       - ./proxies.txt:/app/proxies.txt:ro
+      - ./ignore_markers.txt:/app/ignore_markers.txt:ro
     ulimits:
       nofile:
         soft: 65536
@@ -37,6 +40,8 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
+    networks:
+      - scanner-network
 
   adminpanel:
     build: ./adminpanel
@@ -55,6 +60,8 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    networks:
+      - scanner-network
 
   postgres-dev:
     image: postgres:16-alpine
@@ -66,3 +73,7 @@ services:
       - "5433:5432"
     volumes:
       - ./dev/seed.sql:/docker-entrypoint-initdb.d/001_seed.sql:ro
+
+networks:
+  scanner-network:
+    external: true

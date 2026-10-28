@@ -47,6 +47,7 @@ from .ai_verify import (
     verify_wp_creds,
 )
 from .config import Settings
+from .ignore import match_ignore_marker
 from .models import HostRow, CheckResult
 
 
@@ -1161,7 +1162,7 @@ def classify_response(body: str) -> tuple[list[str], str]:
     return patterns_found, max_severity
 
 
-async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> CheckResult:
+async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None, markers: list[str] | None = None) -> CheckResult:
     """
     Проверяет хост: ищет OpenAPI, тестирует эндпоинты.
 
@@ -1202,6 +1203,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             result.latency_ms = int((time.perf_counter() - started) * 1000)
                         if resp.status == 200:
                             text = await resp.text()
+                            # Игнор декоев по маркеру в теле (ранний выход)
+                            m = match_ignore_marker(text, markers)
+                            if m:
+                                return CheckResult(is_alive=True, data={"ignored": True, "ignored_marker": m})
                             if is_openapi_spec(text):
                                 spec = json.loads(text)
                                 spec_path = path
@@ -1289,6 +1294,10 @@ async def check_host(row: HostRow, cfg: Settings, proxy: str | None = None) -> C
                             # 16 одинаковых "vulnerable" (ложные срабатывания)
                             if not (200 <= rresp.status < 300):
                                 continue
+                            # Игнор декоев по маркеру в теле (ранний выход)
+                            m = match_ignore_marker(pbody, markers)
+                            if m:
+                                return CheckResult(is_alive=True, data={"ignored": True, "ignored_marker": m})
                             # одно и то же тело на разных путях - один наход
                             body_sig = pbody[:1000]
                             if body_sig in probe_bodies_seen:

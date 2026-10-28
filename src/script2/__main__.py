@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .config import Settings
 from .db import create_pool
+from .ignore import load_ignore_markers
 from .repository import Repository
 from .worker import Worker, reaper_loop
 
@@ -77,6 +78,13 @@ async def main() -> None:
     if proxies:
         log.info("Loaded %d proxies", len(proxies))
 
+    # Загружаем маркеры игнора по телу (декои/teapots)
+    markers = load_ignore_markers(cfg)
+    if markers:
+        log.info("Loaded %d ignore body markers", len(markers))
+    else:
+        log.info("Body ignore disabled (no markers)")
+
     stop = asyncio.Event()
     install_stop_handlers(asyncio.get_running_loop(), stop)
 
@@ -85,7 +93,7 @@ async def main() -> None:
     log.info("Database pool created size=%d", cfg.db_pool_size)
 
     repo = Repository(pool, cfg)
-    worker = Worker(repo, cfg, stop, proxies=proxies)
+    worker = Worker(repo, cfg, stop, proxies=proxies, markers=markers)
 
     try:
         # Запускаем worker и reaper параллельно

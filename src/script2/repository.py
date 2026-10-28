@@ -105,6 +105,17 @@ WHERE lh.check_status IN ('new', 'retry')
 RETURNING id
 """
 
+SQL_MARK_IGNORED = """
+UPDATE live_hosts
+SET check_status = 'done',
+    checked_at = now(),
+    locked_by = NULL,
+    locked_until = NULL,
+    last_error = left('ignored body: ' || $3, 2000)
+WHERE id = $1 AND locked_by = $2 AND check_status = 'in_progress'
+RETURNING id
+"""
+
 
 class Repository:
     """Работа с БД: claim, save, retry, reap."""
@@ -208,3 +219,18 @@ class Repository:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(SQL_MARK_DUPLICATES_DONE)
             return [r["id"] for r in rows]
+
+    async def mark_ignored(self, row_id: int, marker: str) -> bool:
+        """Помечает хост как ignored (декой по маркеру в теле).
+
+        Снимает лизу, ставит done + last_error. В checked_hosts НЕ пишем.
+        Возвращает True если запись обновлена, False при потере лизы.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchval(
+                SQL_MARK_IGNORED,
+                row_id,
+                self.worker_id,
+                marker or "unknown",
+            )
+            return row is not None
