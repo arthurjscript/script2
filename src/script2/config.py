@@ -19,8 +19,8 @@ class Settings(BaseSettings):
 
     # Воркер
     worker_id: str = ""
-    concurrency: int = 100
-    batch_size: int = 50
+    concurrency: int = 20
+    batch_size: int = 20
 
     # Таймауты
     # check_timeout: на КАЖДЫЙ HTTP-запрос (aiohttp total). Долгие GET
