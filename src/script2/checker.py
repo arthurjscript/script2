@@ -323,6 +323,10 @@ SENSITIVE_PATTERNS = {
         r'|\bsb_secret_[A-Za-z0-9]{30,60}\b'),
     # Firecrawl: scraping-сервис с платными кредитами
     "firecrawl_key": re.compile(r'\bfc-[A-Za-z0-9]{32}\b'),
+    # Roblox .ROBLOSECURITY cookie: полный доступ к аккаунту (ROBUX, items, личные данные)
+    # Формат: _|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items.|_<token>
+    "roblox_cookie": re.compile(
+        r'_\|WARNING:-DO-NOT-SHARE-THIS\.--Sharing-this-will-allow-someone-to-log-in-as-you-and-to-steal-your-ROBUX-and-items\.\|_[A-Za-z0-9]{300,800}'),
 
     # MEDIUM - DSN с credentials (требуют user:pass@)
     "postgres_dsn": re.compile(r'postgres(?:ql)?://[^\s"]+:[^\s"]+@[^\s"]+'),
@@ -918,6 +922,10 @@ SEVERITY_MAP = {
     "supabase_key_valid": "LOW",
     "firecrawl_key": "HIGH",
     "firecrawl_key_valid": "HIGH",
+    # Roblox .ROBLOSECURITY cookie = полный доступ к аккаунту (ROBUX, покупки)
+    "roblox_cookie": "CRITICAL",
+    # Roblox API (без cookie, но связанный с Roblox сервис)
+    "roblox_api": "MEDIUM",
     # MEDIUM - DSN
     "postgres_dsn": "MEDIUM",
     "mysql_dsn": "MEDIUM",
